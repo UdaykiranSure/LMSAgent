@@ -1,0 +1,81 @@
+# configs/ppo_config.yaml
+# All hyperparameters in one place — no magic numbers in code
+
+model:
+  base_model: "Qwen/Qwen2.5-3B-Instruct"   # swap to 3B for faster iteration
+  sft_checkpoint: "checkpoints/sft"
+  load_in_4bit: false                        # set true if GPU < 24GB
+  use_lora: true
+  lora:
+    r: 16
+    lora_alpha: 32
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj",
+                     "gate_proj", "up_proj", "down_proj"]
+    lora_dropout: 0.05
+    bias: "none"
+
+ppo:
+  # Core PPO knobs
+  learning_rate: 1.4e-5
+  batch_size: 32                # queries per PPO iteration
+  mini_batch_size: 4            # queries per gradient step inside epoch
+  ppo_epochs: 4                 # gradient epochs per collected batch
+  gamma: 0.99                   # discount factor
+  lam: 0.95                     # GAE lambda
+  cliprange: 0.2                # PPO clip epsilon
+  cliprange_value: 0.2          # value function clip
+  vf_coef: 0.1                  # value loss coefficient
+  max_grad_norm: 0.5
+
+  # KL penalty — keeps policy close to SFT reference
+  kl_penalty: "kl"              # "kl" | "abs" | "mse" | "full"
+  init_kl_coef: 0.05            # beta — start low, agent has room to explore
+  target_kl: 6.0                # adaptive KL target
+  horizon: 10000                # steps for KL adaptive controller
+
+  # Generation during rollout
+  max_new_tokens: 256           # per step (tool call or respond)
+  temperature: 0.7
+  top_p: 0.9
+  do_sample: true
+
+training:
+  total_episodes: 50000         # across all stages
+  stage2_episodes: 30000        # dense reward phase
+  stage3_episodes: 20000        # sparse reward phase
+  eval_every: 500               # episodes between evals
+  save_every: 1000
+  seed: 42
+  log_with: "wandb"             # "wandb" | "tensorboard" | null
+  project_name: "student-agent-ppo"
+
+rollout:
+  rollouts_per_query: 4         # G in GRPO / group size for advantage estimation
+  max_steps_l1: 5               # level 1 query budget
+  max_steps_l2: 12              # level 2
+  max_steps_l3: 28              # level 3 (3N+4, N=8 subjects)
+
+reward:
+  # Component weights — must sum to ~1.0 for interpretability
+  correctness_weight:    1.0
+  tool_path_weight:      0.4
+  subject_scope_weight:  0.3
+  temporal_weight:       0.3
+  write_ops_weight:      0.6
+  step_limit_weight:     0.2
+  # Hallucination penalty is multiplicative — not weighted
+  hallucination_penalty: -1.0
+
+  # Dense vs sparse annealing
+  dense_reward_weight:   1.0    # stage 2: full dense
+  sparse_reward_weight:  0.0    # stage 2: no sparse
+  # override in stage 3:
+  # dense_reward_weight: 0.2
+  # sparse_reward_weight: 1.0
+
+curriculum:
+  stage2_levels: [1, 2]         # query levels active in stage 2
+  stage3_levels: [1, 2, 3]      # all levels in stage 3
+  level_weights:                # sampling probability per level
+    stage2: [0.5, 0.5, 0.0]
+    stage3: [0.2, 0.3, 0.5]
