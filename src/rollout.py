@@ -1,278 +1,211 @@
-# src/rollout.py
 """
-collect_rollouts() — the bridge between the environment and TRL's PPO trainer.
+src/rollout.py
 
-For each query in the batch:
-  1. Run the agent (policy model) step-by-step through the environment
-  2. Collect (token_ids, log_probs, values, rewards) at each step
-  3. Compute per-token rewards: 0 everywhere except terminal step
-  4. Return lists that PPOTrainer.step() expects
+Connects the StudentAgentEnvironment to the PPO buffer.
 
-Key design decisions:
-  - We treat each FULL episode as one "response" in PPO terms
-  - The entire tool-call chain + RESPOND is concatenated into one sequence
-  - Terminal reward from the rule-based model is assigned to the last token
-  - Intermediate shaping rewards (from environment) are added at each tool step
+For each episode:
+  1. Tokenise the initial prompt
+  2. While not done:
+     a. Format current context → generate one step
+     b. Step the environment
+     c. Accumulate tokens
+  3. Score the completed trajectory with RuleBasedRewardModel
+  4. Package everything into an Episode dataclass
+
+Key design: we collect (input_ids, response_mask, old_log_probs, old_values)
+during rollout with no_grad, then recompute them with grad during the PPO update.
+This is the standard "collect then update" PPO pattern.
 """
 
-import torch
 import re
 import json
-from dataclasses import dataclass
-from typing import Optional
+import torch
+import logging
 from datetime import date
+from typing import Optional
 
-from transformers import PreTrainedTokenizer, PreTrainedModel
+from src.ppo_core import ActorCritic, Episode, PPOConfig
 
-from src.environment import StudentAgentEnvironment
-from src.reward import RuleBasedRewardModel
-from src.oracle import GroundTruth
-from src.mock_db import MockStudentDB
+logger = logging.getLogger(__name__)
+
+# ── Prompt formatting ──────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """You are a student assistant. You have zero prior knowledge about the student.
+You must discover all information through tool calls before answering.
+
+Always start with get_subjects() to confirm the subject exists.
+Then call get_assignments(), get_grades(), get_schedule() etc as needed.
+End with <respond>your answer here</respond>.
+
+Tool call format: <tool_call>{"tool": "name", "params": {...}}</tool_call>
+Final answer format: <respond>answer text here</respond>"""
 
 
-@dataclass
-class EpisodeExperience:
+def format_messages(messages: list[dict]) -> str:
     """
-    Everything PPOTrainer.step() needs for one episode.
-    TRL expects flat token lists — we produce one per episode.
-    """
-    query_ids:       torch.Tensor   # tokenised query (the "prompt")
-    response_ids:    torch.Tensor   # tokenised full agent output (all steps)
-    reward:          float          # scalar terminal reward
-    shaping_rewards: list[float]    # per-step intermediate rewards (for logging)
-    steps_taken:     int
-    exit_type:       str            # "respond" | "step_limit" | "error"
-    tool_calls_made: list[str]      # for logging/debugging
+    Convert the context window (list of role/content dicts) to a
+    single string in Qwen2.5 chat format.
 
+    Qwen2.5-Instruct uses:
+      <|im_start|>system\n...<|im_end|>
+      <|im_start|>user\n...<|im_end|>
+      <|im_start|>assistant\n
+    """
+    parts = []
+    for msg in messages:
+        role    = msg["role"]
+        content = msg["content"]
+        if role == "system":
+            parts.append(f"<|im_start|>system\n{content}<|im_end|>")
+        elif role == "user":
+            parts.append(f"<|im_start|>user\n{content}<|im_end|>")
+        elif role in ("assistant", "tool"):
+            name = msg.get("name", "")
+            prefix = f"[{name}] " if name else ""
+            parts.append(f"<|im_start|>assistant\n{prefix}{content}<|im_end|>")
+    # Open the next assistant turn
+    parts.append("<|im_start|>assistant\n")
+    return "\n".join(parts)
+
+
+# ── Rollout collector ──────────────────────────────────────────────────
 
 class RolloutCollector:
     """
-    Runs a batch of episodes, collects experience for PPO.
-
-    Args:
-        model:       the policy (actor) model — used for generation
-        tokenizer:   shared tokenizer
-        reward_model: RuleBasedRewardModel instance
-        config:      full config dict
-        device:      torch device
+    Runs episodes and returns filled Episode objects ready for the PPO buffer.
+    All generation is done with no_grad.
     """
 
     def __init__(
         self,
-        model: PreTrainedModel,
-        tokenizer: PreTrainedTokenizer,
-        reward_model: RuleBasedRewardModel,
-        config: dict,
-        device: torch.device,
+        actor_critic:  ActorCritic,
+        tokenizer,
+        reward_model,
+        cfg:           PPOConfig,
+        device:        torch.device,
     ):
-        self.model        = model
+        self.ac           = actor_critic
         self.tokenizer    = tokenizer
         self.reward_model = reward_model
-        self.config       = config
+        self.cfg          = cfg
         self.device       = device
-        self.gen_config   = config["ppo"]
 
     @torch.no_grad()
-    def collect(
+    def collect_episode(
         self,
-        queries:         list[str],
-        mock_dbs:        list[MockStudentDB],
-        ground_truths:   list[GroundTruth],
-        today:           Optional[date] = None,
-    ) -> list[EpisodeExperience]:
-        """
-        Run one episode per (query, db, gt) triple.
-        Returns a list of EpisodeExperience — one per query.
-        """
+        query:    str,
+        mock_db,
+        gt,
+        today:    Optional[date] = None,
+    ) -> Episode:
+        """Run one full episode and return an Episode."""
         today = today or date.today()
-        experiences = []
 
-        for query, db, gt in zip(queries, mock_dbs, ground_truths):
-            exp = self._run_episode(query, db, gt, today)
-            experiences.append(exp)
+        # Import here to avoid circular imports
+        from src.environment import StudentAgentEnvironment
+        env = StudentAgentEnvironment(mock_db, gt, query, today)
 
-        return experiences
+        # ── Build initial prompt ──────────────────────────────────────
+        prompt_text  = format_messages(env.state.context_window)
+        prompt_ids   = self.tokenizer(
+            prompt_text,
+            return_tensors = "pt",
+            truncation     = True,
+            max_length     = 1024,
+        )["input_ids"][0]                             # (P,)
+        prompt_len   = len(prompt_ids)
 
-    def _run_episode(
-        self,
-        query:  str,
-        db:     MockStudentDB,
-        gt:     GroundTruth,
-        today:  date,
-    ) -> EpisodeExperience:
-        """
-        Run one full episode:
-        agent calls tools until RESPOND or step limit.
-        """
-        env = StudentAgentEnvironment(db, gt, query, today)
+        # Running buffers for the full sequence
+        all_ids         = prompt_ids.tolist()
+        response_tokens = []                          # tokens added after prompt
+        shaping_rewards = []
 
-        # Tokenise the initial prompt (query + system prompt)
-        prompt_text = self._format_prompt(env.state.context_window)
-        query_ids   = self._tokenize(prompt_text)
-
-        # Accumulate all response tokens across steps
-        all_response_tokens = []
-        shaping_rewards     = []
-        exit_type           = "step_limit"
-
+        # ── Step loop ─────────────────────────────────────────────────
         while not env.state.done:
-            # Build current context into a string for generation
-            context_text = self._format_context(env.state.context_window)
+            # Tokenise current full context
+            ctx_text = format_messages(env.state.context_window)
+            ctx_ids  = self.tokenizer(
+                ctx_text,
+                return_tensors = "pt",
+                truncation     = True,
+                max_length     = 2048,
+            )["input_ids"].to(self.device)           # (1, T)
+            ctx_mask = torch.ones_like(ctx_ids)
 
-            # Generate one step
-            step_tokens, step_text = self._generate_step(context_text)
-            all_response_tokens.extend(step_tokens)
+            # Generate one step (one tool call or respond)
+            new_token_ids, step_text = self.ac.generate_step(
+                ctx_ids, ctx_mask, self.tokenizer
+            )
+            response_tokens.extend(new_token_ids)
 
-            # Step the environment
+            # Step environment
             obs = env.step(step_text)
-
-            # Collect intermediate shaping reward
-            shaping_r = obs.get("intermediate_reward") or 0.0
-            shaping_rewards.append(shaping_r)
+            shaping_rewards.append(obs.get("intermediate_reward") or 0.0)
 
             if obs["done"]:
-                exit_type = obs["info"].get("reason", "respond")
                 break
 
-        # Build trajectory object for the reward model
-        trajectory = env.build_trajectory()
+        # ── Build full sequence tensor ────────────────────────────────
+        full_ids = prompt_ids.tolist() + response_tokens
 
-        # Score with rule-based reward model
-        score_result  = self.reward_model.score(trajectory, gt)
-        terminal_reward = float(score_result["total"])
+        # Pad or truncate to max_length
+        max_len  = 2048
+        if len(full_ids) > max_len:
+            # Keep prompt + truncate response from the right
+            full_ids = full_ids[:prompt_len] + full_ids[prompt_len:max_len]
 
-        # Tokenise the full response
-        full_response_text = self.tokenizer.decode(
-            all_response_tokens, skip_special_tokens=True
+        full_ids_t  = torch.tensor(full_ids,  dtype=torch.long)
+        attn_mask_t = torch.ones(len(full_ids), dtype=torch.long)
+
+        # Response mask: 1 for response tokens, 0 for prompt
+        resp_mask = torch.zeros(len(full_ids), dtype=torch.long)
+        resp_mask[prompt_len:] = 1
+
+        # ── Score trajectory ──────────────────────────────────────────
+        trajectory   = env.build_trajectory()
+        score_result = self.reward_model.score(trajectory, gt)
+        terminal_r   = float(score_result["total"])
+
+        # Combine terminal + shaping (shaping weighted by dense_weight)
+        # For now kept simple: just terminal reward
+        reward = terminal_r
+
+        # ── Collect old log_probs and values (no_grad) ────────────────
+        ids_gpu  = full_ids_t.unsqueeze(0).to(self.device)
+        mask_gpu = attn_mask_t.unsqueeze(0).to(self.device)
+        rm_gpu   = resp_mask.unsqueeze(0).to(self.device)
+
+        old_lp, old_vals = self.ac.get_logprobs_and_values(
+            ids_gpu, mask_gpu, rm_gpu
         )
-        response_ids = torch.tensor(
-            all_response_tokens, dtype=torch.long
-        )
+        old_lp   = old_lp.squeeze(0).cpu()
+        old_vals = old_vals.squeeze(0).cpu()
 
-        return EpisodeExperience(
-            query_ids       = query_ids,
-            response_ids    = response_ids,
-            reward          = terminal_reward,
-            shaping_rewards = shaping_rewards,
+        return Episode(
+            input_ids       = full_ids_t,
+            attention_mask  = attn_mask_t,
+            response_mask   = resp_mask,
+            old_log_probs   = old_lp,
+            old_values      = old_vals,
+            reward          = reward,
             steps_taken     = len(shaping_rewards),
-            exit_type       = exit_type,
-            tool_calls_made = [c["tool"] for c in trajectory["tool_calls"]],
+            exit_type       = env.state.steps[-1].is_terminal and "respond" or "step_limit"
+                              if env.state.steps else "error",
+            tool_sequence   = [c["tool"] for c in trajectory.get("tool_calls", [])],
         )
 
-    @torch.no_grad()
-    def _generate_step(self, context_text: str) -> tuple[list[int], str]:
-        """
-        Generate one agent step (one tool call or RESPOND).
-        Returns (token_ids, decoded_text).
-        """
-        inputs = self.tokenizer(
-            context_text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=4096,
-        ).to(self.device)
-
-        output = self.model.generate(
-            **inputs,
-            max_new_tokens   = self.gen_config["max_new_tokens"],
-            temperature      = self.gen_config["temperature"],
-            top_p            = self.gen_config["top_p"],
-            do_sample        = self.gen_config["do_sample"],
-            pad_token_id     = self.tokenizer.eos_token_id,
-            eos_token_id     = self.tokenizer.eos_token_id,
-            # Stop at closing tags so we don't bleed across steps
-            # stopping_criteria added below
-        )
-
-        # Only new tokens (not the prompt)
-        prompt_len    = inputs["input_ids"].shape[1]
-        new_token_ids = output[0][prompt_len:].tolist()
-        decoded       = self.tokenizer.decode(
-            new_token_ids, skip_special_tokens=True
-        )
-
-        # Trim to the first complete tag
-        decoded = self._trim_to_first_tag(decoded)
-
-        return new_token_ids, decoded
-
-    def _trim_to_first_tag(self, text: str) -> str:
-        """Keep only up to the first complete </tool_call> or </respond>."""
-        for end_tag in ["</tool_call>", "</respond>"]:
-            idx = text.find(end_tag)
-            if idx != -1:
-                return text[:idx + len(end_tag)]
-        return text
-
-    def _format_prompt(self, context_window: list[dict]) -> str:
-        """Format the initial system+user turns as a string."""
-        parts = []
-        for msg in context_window:
-            role    = msg["role"]
-            content = msg["content"]
-            if role == "system":
-                parts.append(f"<|system|>\n{content}")
-            elif role == "user":
-                parts.append(f"<|user|>\n{content}")
-        parts.append("<|assistant|>")
-        return "\n".join(parts)
-
-    def _format_context(self, context_window: list[dict]) -> str:
-        """Format the full context including tool results so far."""
-        parts = []
-        for msg in context_window:
-            role    = msg["role"]
-            content = msg["content"]
-            if role == "system":
-                parts.append(f"<|system|>\n{content}")
-            elif role == "user":
-                parts.append(f"<|user|>\n{content}")
-            elif role == "tool":
-                parts.append(f"<|tool|> [{msg.get('name','')}]\n{content}")
-            elif role == "assistant":
-                parts.append(f"<|assistant|>\n{content}")
-        parts.append("<|assistant|>")
-        return "\n".join(parts)
-
-    def _tokenize(self, text: str) -> torch.Tensor:
-        ids = self.tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=2048,
-        )["input_ids"][0]
-        return ids
-
-
-def experiences_to_ppo_batch(
-    experiences: list[EpisodeExperience],
-    dense_weight: float = 1.0,
-    sparse_weight: float = 0.0,
-) -> tuple[list, list, list]:
-    """
-    Convert EpisodeExperience list into the three lists
-    PPOTrainer.step() expects:
-        queries:   list of 1-D LongTensors  (prompt token ids)
-        responses: list of 1-D LongTensors  (response token ids)
-        rewards:   list of scalar Tensors   (one reward per episode)
-
-    Reward composition:
-        dense:  sum of intermediate shaping rewards (per-step guidance)
-        sparse: terminal reward from rule-based model
-        total:  dense_weight * dense + sparse_weight * sparse
-    """
-    queries   = []
-    responses = []
-    rewards   = []
-
-    for exp in experiences:
-        dense_r  = sum(exp.shaping_rewards) * dense_weight
-        sparse_r = exp.reward               * sparse_weight
-        # Clamp to [-1, 1] after combining
-        total_r  = max(-1.0, min(1.0, dense_r + sparse_r))
-
-        queries.append(exp.query_ids)
-        responses.append(exp.response_ids)
-        rewards.append(torch.tensor(total_r, dtype=torch.float))
-
-    return queries, responses, rewards
+    def collect_batch(
+        self,
+        queries:  list[str],
+        dbs:      list,
+        gts:      list,
+        today:    Optional[date] = None,
+    ) -> list[Episode]:
+        episodes = []
+        for q, db, gt in zip(queries, dbs, gts):
+            try:
+                ep = self.collect_episode(q, db, gt, today)
+                episodes.append(ep)
+            except Exception as e:
+                logger.warning(f"Episode failed: {e}")
+        return episodes

@@ -1,392 +1,310 @@
-# src/trainer.py
 """
-PPOStudentTrainer — main training loop.
+src/trainer.py
 
-Architecture:
-  - Actor:   policy LLM (LoRA fine-tuned) — generates tool calls + RESPOND
-  - Critic:  value head on top of actor backbone — estimates V(state)
-  - Ref:     frozen copy of SFT model — KL penalty anchor
-  - Reward:  RuleBasedRewardModel — no neural reward model needed
+Main PPO training loop.
 
-TRL's PPOTrainer handles:
-  - GAE advantage computation
-  - Clipped surrogate objective
-  - Value function loss
-  - KL penalty against reference model
-  - Adaptive KL controller
-  - Gradient accumulation + clipping
-
-We handle:
-  - Episode rollout via RolloutCollector
-  - Curriculum-aware query sampling
-  - Stage transitions (dense → sparse rewards)
-  - Evaluation and checkpointing
+Flow per iteration:
+  ┌──────────────────────────────────────────────────────────┐
+  │  1. Sample batch_size queries from curriculum dataset    │
+  │  2. RolloutCollector runs each query through env         │
+  │     → actor generates tool calls step by step           │
+  │     → environment executes tools, steps state           │
+  │     → reward model scores completed trajectory          │
+  │     → Episode(tokens, old_logprobs, values, reward)     │
+  │  3. PPOBuffer.compute_advantages() — GAE over episodes  │
+  │  4. PPOUpdater.update() — K epochs of PPO               │
+  │     → for each mini-batch:                              │
+  │         forward(ids) → new_logprobs, new_values         │
+  │         ref_forward(ids) → ref_logprobs                 │
+  │         policy_loss + value_loss + entropy - KL         │
+  │         backward + clip + step                          │
+  │  5. Log metrics, checkpoint, advance curriculum         │
+  └──────────────────────────────────────────────────────────┘
 """
 
 import os
-import yaml
-import torch
-import wandb
+import json
+import time
 import logging
+import random
+import numpy as np
+import torch
 from datetime import date
+from collections import deque
 from typing import Optional
 
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
+from transformers import AutoTokenizer
+from src.ppo_core import (
+    PPOConfig, ActorCritic, ReferenceModel,
+    AdaptiveKLController, PPOBuffer, PPOUpdater
 )
-from peft import (
-    LoraConfig,
-    get_peft_model,
-    PeftModel,
-)
-from trl import (
-    PPOConfig,
-    PPOTrainer,
-    AutoModelForCausalLMWithValueHead,
-)
-
-from src.dataset import EpisodeDataset
-from src.rollout import RolloutCollector, experiences_to_ppo_batch
-from src.reward import RuleBasedRewardModel
-from src.environment import StudentAgentEnvironment
+from src.rollout import RolloutCollector
 
 logger = logging.getLogger(__name__)
 
 
-class PPOStudentTrainer:
+class PPOTrainer:
     """
-    Orchestrates the full PPO training loop for the student agent.
-
-    Usage:
-        trainer = PPOStudentTrainer(config_path="configs/ppo_config.yaml", stage=2)
-        trainer.train()
+    Self-contained PPO trainer for the student agent.
+    No TRL, no external RL framework.
     """
 
-    def __init__(self, config_path: str, stage: int = 2):
-        self.config  = self._load_config(config_path)
-        self.stage   = stage
-        self.device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def __init__(self, cfg: PPOConfig):
+        self.cfg    = cfg
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        logger.info(f"Initialising PPO trainer — stage {stage} on {self.device}")
-        self._setup_logging()
-        self._build_components()
+        _set_seed(cfg.seed)
+        logger.info(f"Device: {self.device}")
 
-    # ─────────────────────────────────────────────────────────────────
-    # Initialisation
-    # ─────────────────────────────────────────────────────────────────
+        self._build()
 
-    def _load_config(self, path: str) -> dict:
-        with open(path) as f:
-            return yaml.safe_load(f)
+    def _build(self):
+        cfg = self.cfg
 
-    def _setup_logging(self):
-        log_cfg = self.config["training"]
-        if log_cfg.get("log_with") == "wandb":
-            wandb.init(
-                project = log_cfg["project_name"],
-                name    = f"ppo-stage{self.stage}",
-                config  = self.config,
-            )
-
-    def _build_components(self):
-        cfg        = self.config
-        model_cfg  = cfg["model"]
-        ppo_cfg    = cfg["ppo"]
-
-        # ── Tokenizer ─────────────────────────────────────────────────
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_cfg["base_model"],
-            padding_side = "left",      # left-pad for decoder-only generation
-        )
+        # ── Tokenizer ──────────────────────────────────────────────────
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "left"
 
-        # ── Actor + value head ────────────────────────────────────────
-        # AutoModelForCausalLMWithValueHead wraps the LLM and adds a
-        # scalar value head (linear layer) on top of the last hidden state.
-        # This is what TRL's PPOTrainer expects.
-        sft_ckpt = model_cfg.get("sft_checkpoint", model_cfg["base_model"])
-        logger.info(f"Loading actor from {sft_ckpt}")
+        # ── Actor-Critic (policy + value head) ────────────────────────
+        self.actor_critic = ActorCritic(cfg, self.device)
 
-        base = AutoModelForCausalLM.from_pretrained(
-            sft_ckpt,
-            torch_dtype  = torch.bfloat16,
-            device_map   = "auto",
-            load_in_4bit = model_cfg.get("load_in_4bit", False),
+        # ── Frozen reference model ─────────────────────────────────────
+        self.ref_model = ReferenceModel(cfg.model_name, self.device)
+
+        # ── KL controller ──────────────────────────────────────────────
+        self.kl_ctrl = AdaptiveKLController(
+            cfg.init_kl_coef, cfg.target_kl, cfg.kl_horizon
         )
 
-        # Apply LoRA if requested
-        if model_cfg.get("use_lora", True):
-            lora_cfg = LoraConfig(**{
-                k: v for k, v in model_cfg["lora"].items()
-            })
-            base = get_peft_model(base, lora_cfg)
-            base.print_trainable_parameters()
-
-        # Wrap with value head — this becomes our actor/critic
-        self.model = AutoModelForCausalLMWithValueHead(base)
-        self.model.to(self.device)
-
-        # ── Reference model — frozen SFT weights ──────────────────────
-        # TRL uses this to compute KL(π_θ || π_ref) per token
-        logger.info("Loading frozen reference model")
-        self.ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-            sft_ckpt,
-            torch_dtype = torch.bfloat16,
-            device_map  = "auto",
-        )
-        # Freeze all ref model params
-        for p in self.ref_model.parameters():
-            p.requires_grad_(False)
-
-        # ── PPO config ────────────────────────────────────────────────
-        self.ppo_config = PPOConfig(
-            # Naming
-            model_name             = model_cfg["base_model"],
-            # Batch sizes
-            batch_size             = ppo_cfg["batch_size"],
-            mini_batch_size        = ppo_cfg["mini_batch_size"],
-            gradient_accumulation_steps = max(
-                1, ppo_cfg["batch_size"] // ppo_cfg["mini_batch_size"]
-            ),
-            # PPO hyperparams
-            ppo_epochs             = ppo_cfg["ppo_epochs"],
-            learning_rate          = ppo_cfg["learning_rate"],
-            gamma                  = ppo_cfg["gamma"],
-            lam                    = ppo_cfg["lam"],
-            cliprange              = ppo_cfg["cliprange"],
-            cliprange_value        = ppo_cfg["cliprange_value"],
-            vf_coef                = ppo_cfg["vf_coef"],
-            max_grad_norm          = ppo_cfg["max_grad_norm"],
-            # KL penalty
-            kl_penalty             = ppo_cfg["kl_penalty"],
-            init_kl_coef           = ppo_cfg["init_kl_coef"],
-            target_kl              = ppo_cfg["target_kl"],
-            horizon                = ppo_cfg["horizon"],
-            # Logging
-            log_with               = self.config["training"].get("log_with"),
-            # Reproducibility
-            seed                   = self.config["training"]["seed"],
+        # ── PPO updater ────────────────────────────────────────────────
+        self.updater = PPOUpdater(
+            self.actor_critic, self.ref_model,
+            self.kl_ctrl, cfg, self.device
         )
 
-        # ── TRL PPOTrainer ────────────────────────────────────────────
-        # PPOTrainer manages: optimizer, scheduler, GAE, loss computation
-        self.ppo_trainer = PPOTrainer(
-            config    = self.ppo_config,
-            model     = self.model,
-            ref_model = self.ref_model,
-            tokenizer = self.tokenizer,
-        )
+        # ── Reward model ───────────────────────────────────────────────
+        from src.reward import RuleBasedRewardModel
+        self.reward_model = RuleBasedRewardModel()
 
-        # ── Reward model ──────────────────────────────────────────────
-        self.reward_model = RuleBasedRewardModel(self.config["reward"])
+        # ── Dataset ────────────────────────────────────────────────────
+        from src.dataset import EpisodeDataset
+        self.dataset = EpisodeDataset(seed=cfg.seed)
 
-        # ── Dataset (query sampler) ───────────────────────────────────
-        self.dataset = EpisodeDataset(
-            config = self.config,
-            stage  = self.stage,
-            seed   = self.config["training"]["seed"],
-        )
-
-        # ── Rollout collector ─────────────────────────────────────────
-        self.rollout_collector = RolloutCollector(
-            model        = self.model,
+        # ── Rollout collector ──────────────────────────────────────────
+        self.collector = RolloutCollector(
+            actor_critic = self.actor_critic,
             tokenizer    = self.tokenizer,
             reward_model = self.reward_model,
-            config       = self.config,
+            cfg          = cfg,
             device       = self.device,
         )
 
-    # ─────────────────────────────────────────────────────────────────
+        # ── Metrics tracking ───────────────────────────────────────────
+        self.metrics_window = deque(maxlen=50)   # rolling window for logging
+        self.global_step    = 0
+        self.best_reward    = -float("inf")
+
+    # ──────────────────────────────────────────────────────────────────
     # Main training loop
-    # ─────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────
 
-    def train(self):
-        cfg           = self.config["training"]
-        ppo_cfg       = self.config["ppo"]
-        reward_cfg    = self.config["reward"]
-        batch_size    = ppo_cfg["batch_size"]
+    def train(self, stage: int = 2):
+        cfg = self.cfg
+        logger.info(f"Starting PPO training — stage {stage}, device={self.device}")
+        logger.info(f"Total episodes: {cfg.total_episodes}, batch_size: {cfg.batch_size}")
 
-        # Stage-specific reward weighting
-        dense_w  = reward_cfg["dense_reward_weight"]
-        sparse_w = reward_cfg["sparse_reward_weight"]
+        # Stage-specific settings
+        dense_w  = 1.0 if stage == 2 else 0.2
+        sparse_w = 0.0 if stage == 2 else 1.0
+        levels   = [1, 2] if stage == 2 else [1, 2, 3]
+        self.dataset.set_levels(levels)
 
-        total_episodes  = (
-            cfg["stage2_episodes"] if self.stage == 2
-            else cfg["stage3_episodes"]
-        )
-        episodes_so_far = 0
-        best_eval_score = -float("inf")
+        buffer     = PPOBuffer()
+        episodes_done = 0
+        t_start    = time.time()
 
-        logger.info(
-            f"Starting PPO stage {self.stage} — "
-            f"{total_episodes} episodes, batch_size={batch_size}, "
-            f"dense_w={dense_w}, sparse_w={sparse_w}"
-        )
+        while episodes_done < cfg.total_episodes:
 
-        while episodes_so_far < total_episodes:
+            # ── 1. Sample queries ──────────────────────────────────────
+            batch   = self.dataset.sample_batch(cfg.batch_size)
+            queries = [b[0] for b in batch]
+            dbs     = [b[1] for b in batch]
+            gts     = [b[2] for b in batch]
 
-            # ── Step 1: Sample a batch of queries ─────────────────────
-            batch       = self.dataset.sample_batch(batch_size)
-            queries_str = [b[0] for b in batch]
-            dbs         = [b[1] for b in batch]
-            gts         = [b[2] for b in batch]
-
-            # ── Step 2: Collect rollouts ──────────────────────────────
-            # Run the policy in the environment for each query
-            experiences = self.rollout_collector.collect(
-                queries       = queries_str,
-                mock_dbs      = dbs,
-                ground_truths = gts,
+            # ── 2. Collect rollouts ────────────────────────────────────
+            self.actor_critic.eval()
+            episodes = self.collector.collect_batch(
+                queries = queries,
+                dbs     = dbs,
+                gts     = gts,
+                today   = date.today(),
             )
+            self.actor_critic.train()
 
-            # ── Step 3: Convert to PPO batch format ───────────────────
-            # queries:   list[Tensor]  — prompt token ids
-            # responses: list[Tensor]  — response token ids
-            # rewards:   list[Tensor]  — scalar reward per episode
-            queries, responses, rewards = experiences_to_ppo_batch(
-                experiences  = experiences,
-                dense_weight = dense_w,
-                sparse_weight= sparse_w,
-            )
+            if not episodes:
+                logger.warning("Empty episode batch — skipping")
+                continue
 
-            # ── Step 4: PPO update ────────────────────────────────────
-            # PPOTrainer.step() does:
-            #   1. Forward pass on actor → log_probs, values
-            #   2. Forward pass on ref   → ref_log_probs
-            #   3. KL penalty per token: kl = log_probs - ref_log_probs
-            #   4. GAE advantage using values + rewards
-            #   5. PPO clip loss + value loss
-            #   6. Gradient step × ppo_epochs
-            stats = self.ppo_trainer.step(queries, responses, rewards)
+            # ── 3. Apply reward weighting (dense vs sparse) ───────────
+            for ep, original_batch in zip(episodes, batch[:len(episodes)]):
+                # ep.reward is the terminal reward from reward model
+                # For dense mode we could add per-step shaping here
+                ep.reward = ep.reward * (dense_w + sparse_w)
+                ep.reward = max(-1.0, min(1.0, ep.reward))
 
-            episodes_so_far += batch_size
+            # ── 4. Fill buffer ─────────────────────────────────────────
+            buffer.clear()
+            for ep in episodes:
+                buffer.add(ep)
 
-            # ── Step 5: Log metrics ───────────────────────────────────
-            self._log_step(stats, experiences, episodes_so_far)
+            # ── 5. PPO update ──────────────────────────────────────────
+            update_stats = self.updater.update(buffer)
 
-            # ── Step 6: Evaluate ──────────────────────────────────────
-            if episodes_so_far % cfg["eval_every"] == 0:
-                eval_score = self._evaluate()
-                logger.info(
-                    f"[ep {episodes_so_far}] eval_score={eval_score:.3f}"
-                )
-                if eval_score > best_eval_score:
-                    best_eval_score = eval_score
-                    self._save_checkpoint("best")
+            episodes_done += len(episodes)
+            self.global_step += 1
 
-            # ── Step 7: Periodic checkpoint ───────────────────────────
-            if episodes_so_far % cfg["save_every"] == 0:
-                self._save_checkpoint(f"ep_{episodes_so_far}")
+            # ── 6. Log ─────────────────────────────────────────────────
+            rewards = [ep.reward for ep in episodes]
+            self.metrics_window.extend(rewards)
+            self._log(update_stats, episodes, episodes_done, t_start)
+
+            # ── 7. Evaluate ────────────────────────────────────────────
+            if episodes_done % cfg.eval_every < cfg.batch_size:
+                eval_reward = self._evaluate()
+                logger.info(f"[eval @ {episodes_done}] mean_reward={eval_reward:.4f}")
+                if eval_reward > self.best_reward:
+                    self.best_reward = eval_reward
+                    self._save("best")
+
+            # ── 8. Checkpoint ──────────────────────────────────────────
+            if episodes_done % cfg.save_every < cfg.batch_size:
+                self._save(f"step_{episodes_done}")
 
         logger.info("Training complete.")
-        self._save_checkpoint("final")
+        self._save("final")
 
-    # ─────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────
     # Evaluation
-    # ─────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────
 
-    def _evaluate(self, n_queries: int = 40) -> float:
-        """
-        Run n_queries held-out episodes, return mean reward.
-        Uses a fixed seed dataset so results are comparable across checkpoints.
-        """
-        eval_dataset = EpisodeDataset(
-            config = self.config,
-            stage  = self.stage,
-            seed   = 9999,          # fixed seed — never seen during training
-        )
-        self.model.eval()
-        total_reward = 0.0
-        metrics = {
-            "correct":           0,
-            "hallucinated":      0,
-            "tool_order_ok":     0,
-            "early_exit_ok":     0,
-            "step_limit_hit":    0,
-        }
+    def _evaluate(self, n: int = 30) -> float:
+        """Run n held-out episodes and return mean reward."""
+        eval_ds = self.dataset.__class__(seed=99999)
+        eval_ds.set_levels([1, 2, 3])
+        self.actor_critic.eval()
 
-        for _ in range(n_queries):
-            query, db, gt = eval_dataset.sample()
-            exps = self.rollout_collector.collect(
-                queries       = [query],
-                mock_dbs      = [db],
-                ground_truths = [gt],
-            )
-            exp = exps[0]
-            total_reward += exp.reward
+        total = 0.0
+        for _ in range(n):
+            q, db, gt = eval_ds.sample()
+            try:
+                ep     = self.collector.collect_episode(q, db, gt)
+                total += ep.reward
+            except Exception as e:
+                logger.debug(f"Eval episode error: {e}")
 
-            if exp.reward >= 0.9:
-                metrics["correct"] += 1
-            if exp.reward <= -0.8:
-                metrics["hallucinated"] += 1
-            if exp.exit_type == "step_limit":
-                metrics["step_limit_hit"] += 1
+        self.actor_critic.train()
+        return total / n
 
-        mean_reward = total_reward / n_queries
-        metrics     = {k: v / n_queries for k, v in metrics.items()}
-
-        if self.config["training"].get("log_with") == "wandb":
-            wandb.log({"eval/mean_reward": mean_reward, **{
-                f"eval/{k}": v for k, v in metrics.items()
-            }})
-
-        self.model.train()
-        return mean_reward
-
-    # ─────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────
     # Logging
-    # ─────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────
 
-    def _log_step(
+    def _log(
         self,
-        ppo_stats:       dict,
-        experiences:     list,
-        episodes_so_far: int,
+        update_stats:  dict,
+        episodes:      list,
+        episodes_done: int,
+        t_start:       float,
     ):
-        rewards      = [e.reward for e in experiences]
-        steps        = [e.steps_taken for e in experiences]
-        exit_types   = [e.exit_type for e in experiences]
+        rewards     = [ep.reward for ep in episodes]
+        steps       = [ep.steps_taken for ep in episodes]
+        exits       = [ep.exit_type for ep in episodes]
 
-        mean_reward  = sum(rewards) / len(rewards)
-        mean_steps   = sum(steps)   / len(steps)
-        pct_respond  = sum(1 for e in exit_types if e == "respond") / len(exit_types)
-        pct_limit    = sum(1 for e in exit_types if e == "step_limit") / len(exit_types)
+        mean_r      = np.mean(rewards)
+        rolling_r   = np.mean(self.metrics_window)
+        mean_steps  = np.mean(steps)
+        pct_respond = np.mean([1 if e == "respond" else 0 for e in exits])
+        elapsed     = time.time() - t_start
+        eps_per_s   = episodes_done / max(elapsed, 1)
 
-        log_dict = {
-            "train/mean_reward":          mean_reward,
-            "train/mean_steps":           mean_steps,
-            "train/pct_clean_respond":    pct_respond,
-            "train/pct_step_limit_hit":   pct_limit,
-            "train/episodes":             episodes_so_far,
-            # PPO internals from TRL
-            "ppo/policy_loss":            ppo_stats.get("ppo/loss/policy", 0),
-            "ppo/value_loss":             ppo_stats.get("ppo/loss/value", 0),
-            "ppo/entropy":                ppo_stats.get("ppo/policy/entropy", 0),
-            "ppo/kl":                     ppo_stats.get("ppo/mean_scores", 0),
-            "ppo/approx_kl":             ppo_stats.get("ppo/policy/approxkl", 0),
-            "ppo/clipfrac":               ppo_stats.get("ppo/policy/clipfrac", 0),
+        log_data = {
+            "episode":         episodes_done,
+            "reward/mean":     round(mean_r, 4),
+            "reward/rolling50":round(rolling_r, 4),
+            "steps/mean":      round(mean_steps, 2),
+            "respond_pct":     round(pct_respond, 3),
+            "ppo/policy_loss": round(update_stats.get("policy_loss", 0), 5),
+            "ppo/value_loss":  round(update_stats.get("value_loss", 0), 5),
+            "ppo/entropy":     round(update_stats.get("entropy", 0), 5),
+            "ppo/kl":          round(update_stats.get("kl", 0), 5),
+            "ppo/approx_kl":   round(update_stats.get("approx_kl", 0), 5),
+            "ppo/clip_frac":   round(update_stats.get("clip_frac", 0), 5),
+            "ppo/kl_coef":     round(update_stats.get("kl_coef", 0), 5),
+            "ppo/lr":          round(update_stats.get("lr", 0), 8),
+            "eps_per_sec":     round(eps_per_s, 2),
         }
 
         logger.info(
-            f"[ep {episodes_so_far:6d}] "
-            f"reward={mean_reward:+.3f} "
-            f"steps={mean_steps:.1f} "
-            f"respond%={pct_respond*100:.0f}% "
-            f"kl={log_dict['ppo/approx_kl']:.4f}"
+            f"[{episodes_done:6d}] "
+            f"r={mean_r:+.3f} rolling={rolling_r:+.3f} | "
+            f"steps={mean_steps:.1f} respond={pct_respond*100:.0f}% | "
+            f"pg={log_data['ppo/policy_loss']:.4f} "
+            f"vf={log_data['ppo/value_loss']:.4f} "
+            f"kl={log_data['ppo/kl']:.4f} "
+            f"β={log_data['ppo/kl_coef']:.4f}"
         )
 
-        if self.config["training"].get("log_with") == "wandb":
-            wandb.log(log_dict, step=episodes_so_far)
+        # Append to JSONL log
+        os.makedirs("logs", exist_ok=True)
+        with open("logs/train.jsonl", "a") as f:
+            f.write(json.dumps(log_data) + "\n")
 
-    # ─────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────
     # Checkpointing
-    # ─────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────
 
-    def _save_checkpoint(self, tag: str):
+    def _save(self, tag: str):
         path = os.path.join("checkpoints", tag)
         os.makedirs(path, exist_ok=True)
-        self.ppo_trainer.save_pretrained(path)
+        # Save LoRA adapter weights only (much smaller than full model)
+        self.actor_critic.backbone.save_pretrained(path)
         self.tokenizer.save_pretrained(path)
-        logger.info(f"Saved checkpoint → {path}")
+        # Save value head separately
+        torch.save(self.actor_critic.value_head.state_dict(),
+                   os.path.join(path, "value_head.pt"))
+        # Save optimizer + scheduler state
+        torch.save({
+            "optimizer":   self.updater.optimizer.state_dict(),
+            "scheduler":   self.updater.scheduler.state_dict(),
+            "global_step": self.global_step,
+            "kl_coef":     self.kl_ctrl.beta,
+            "best_reward": self.best_reward,
+        }, os.path.join(path, "training_state.pt"))
+        logger.info(f"Checkpoint saved → {path}")
+
+    def load(self, path: str):
+        """Resume from a checkpoint."""
+        from peft import PeftModel
+        self.actor_critic.backbone = PeftModel.from_pretrained(
+            self.actor_critic.backbone, path
+        )
+        self.actor_critic.value_head.load_state_dict(
+            torch.load(os.path.join(path, "value_head.pt"), map_location=self.device)
+        )
+        state = torch.load(os.path.join(path, "training_state.pt"), map_location="cpu")
+        self.updater.optimizer.load_state_dict(state["optimizer"])
+        self.updater.scheduler.load_state_dict(state["scheduler"])
+        self.global_step   = state["global_step"]
+        self.kl_ctrl.beta  = state["kl_coef"]
+        self.best_reward   = state["best_reward"]
+        logger.info(f"Resumed from {path} (step {self.global_step})")
+
+
+def _set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
