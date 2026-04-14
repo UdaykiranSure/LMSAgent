@@ -44,7 +44,7 @@ Final answer format: <respond>answer text here</respond>"""
 def format_messages(messages: list[dict]) -> str:
     """
     Convert the context window (list of role/content dicts) to a
-    single string in Qwen2.5 chat format.
+        single string in Qwen2.5 chat format.
 
     Qwen2.5-Instruct uses:
       <|im_start|>system\n...<|im_end|>
@@ -59,14 +59,19 @@ def format_messages(messages: list[dict]) -> str:
             parts.append(f"<|im_start|>system\n{content}<|im_end|>")
         elif role == "user":
             parts.append(f"<|im_start|>user\n{content}<|im_end|>")
-        elif role in ("assistant", "tool"):
-            name = msg.get("name", "")
-            prefix = f"[{name}] " if name else ""
-            parts.append(f"<|im_start|>assistant\n{prefix}{content}<|im_end|>")
+        elif role == "user":
+            parts.append(f"<|im_start|>user\n{content}<|im_end|>")
+        elif role == "assistant":
+            # Model's own prior generated text
+            parts.append(f"<|im_start|>assistant\n{content}<|im_end|>")
+        elif role == "tool":
+            # Tool result injected by the environment — clearly distinct from assistant
+            # Format: [tool_name]\n{json_result}
+            name = msg.get("name", "tool")
+            parts.append(f"<|im_start|>tool\n[{name}]\n{content}<|im_end|>")
     # Open the next assistant turn
     parts.append("<|im_start|>assistant\n")
     return "\n".join(parts)
-
 
 # ── Rollout collector ──────────────────────────────────────────────────
 
@@ -93,10 +98,12 @@ class RolloutCollector:
     @torch.no_grad()
     def collect_episode(
         self,
+        n_episode,
         query:    str,
         mock_db,
         gt,
         today:    Optional[date] = None,
+        
     ) -> Episode:
         """Run one full episode and return an Episode."""
         today = today or date.today()
@@ -121,14 +128,19 @@ class RolloutCollector:
         shaping_rewards = []
 
         # ── Step loop ─────────────────────────────────────────────────
+        step_count = 0
+        logger.info(f"Episode - {n_episode} - Query {query}")
         while not env.state.done:
+            step_count += 1
+            logger.info(f"Episode step {step_count} starting - Query ")
+
             # Tokenise current full context
             ctx_text = format_messages(env.state.context_window)
             ctx_ids  = self.tokenizer(
                 ctx_text,
                 return_tensors = "pt",
                 truncation     = True,
-                max_length     = 2048,
+                max_length     = 1024,
             )["input_ids"].to(self.device)           # (1, T)
             ctx_mask = torch.ones_like(ctx_ids)
 
@@ -136,10 +148,12 @@ class RolloutCollector:
             new_token_ids, step_text = self.ac.generate_step(
                 ctx_ids, ctx_mask, self.tokenizer
             )
+            logger.info(f"Episode step {step_count} generated: {repr(step_text[:100])}")
             response_tokens.extend(new_token_ids)
 
             # Step environment
             obs = env.step(step_text)
+            logger.info(f"Episode step {step_count} env done: {obs['done']}, reason: {obs.get('info', {}).get('reason', 'ongoing')}")
             shaping_rewards.append(obs.get("intermediate_reward") or 0.0)
 
             if obs["done"]:
@@ -149,7 +163,7 @@ class RolloutCollector:
         full_ids = prompt_ids.tolist() + response_tokens
 
         # Pad or truncate to max_length
-        max_len  = 2048
+        max_len  = 1024
         if len(full_ids) > max_len:
             # Keep prompt + truncate response from the right
             full_ids = full_ids[:prompt_len] + full_ids[prompt_len:max_len]
@@ -202,9 +216,9 @@ class RolloutCollector:
         today:    Optional[date] = None,
     ) -> list[Episode]:
         episodes = []
-        for q, db, gt in zip(queries, dbs, gts):
+        for n_episode, (q, db, gt) in enumerate(zip(queries, dbs, gts)):
             try:
-                ep = self.collect_episode(q, db, gt, today)
+                ep = self.collect_episode(n_episode, q, db, gt, today)
                 episodes.append(ep)
             except Exception as e:
                 logger.warning(f"Episode failed: {e}")

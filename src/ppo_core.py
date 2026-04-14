@@ -5,12 +5,14 @@ Pure PyTorch PPO implementation.
 No TRL, no external RL libraries.
 
 What this implements:
-  - ActorCritic: Qwen2.5-0.5B backbone + LoRA + scalar value head
+  - ActorCritic: Qwen3.5-2B backbone + LoRA + scalar value head
   - ReferenceModel: frozen copy of the SFT weights for KL penalty
   - PPOBuffer: stores one batch of episodes before the update
   - PPOUpdater: runs K epochs of clipped PPO + value loss + KL penalty
   - AdaptiveKLController: adjusts beta to keep KL near target
 
+  
+  
 PPO objective (per token):
   L = E[ min(r_t * A_t,  clip(r_t, 1-eps, 1+eps) * A_t) ]
     - beta * KL(pi_theta || pi_ref)
@@ -36,6 +38,19 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _token_logprobs_from_logits(logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
+    """
+    Compute log p(target_ids | logits) without allocating full log_softmax(logits).
+
+    logits:     (B, T, V)
+    target_ids: (B, T)
+    returns:    (B, T)
+    """
+    gathered = logits.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+    normalizer = torch.logsumexp(logits, dim=-1)
+    return gathered - normalizer
+
+
 # ──────────────────────────────────────────────────────────────────────
 # PPO Hyperparameters
 # ──────────────────────────────────────────────────────────────────────
@@ -43,7 +58,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PPOConfig:
     # Model
-    model_name:          str   = "Qwen/Qwen2.5-0.5B-Instruct"
+    model_name:          str   = "Qwen/Qwen3.5-2B"
     load_in_4bit:        bool  = False
 
     # LoRA
@@ -76,7 +91,7 @@ class PPOConfig:
     ppo_epochs:          int   = 4         # gradient epochs per collected batch
 
     # Generation
-    max_new_tokens:      int   = 200
+    max_new_tokens:      int   = 500
     temperature:         float = 0.8
     top_p:               float = 0.9
 
@@ -122,12 +137,12 @@ class ValueHead(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# ActorCritic — Qwen2.5-0.5B + LoRA + ValueHead
+# ActorCritic — Qwen3.5-2B + LoRA + ValueHead
 # ──────────────────────────────────────────────────────────────────────
 
 class ActorCritic(nn.Module):
     """
-    Wraps Qwen2.5-0.5B as both actor (policy) and critic (value estimator).
+    Wraps Qwen3.5-2B as both actor (policy) and critic (value estimator).
 
     - Actor:  standard LM head → token log-probabilities
     - Critic: ValueHead on last hidden state → scalar V(s)
@@ -147,7 +162,7 @@ class ActorCritic(nn.Module):
         logger.info(f"Loading backbone: {cfg.model_name}")
         self.backbone = AutoModelForCausalLM.from_pretrained(
             cfg.model_name,
-            torch_dtype    = torch.float32,   # fp32 for stability on CPU/small GPU
+            torch_dtype    = torch.bfloat16,   # fp32 for stability on CPU/small GPU
             device_map     = "auto",
         )
 
@@ -163,9 +178,10 @@ class ActorCritic(nn.Module):
             self.backbone = get_peft_model(self.backbone, lora_config)
             self.backbone.print_trainable_parameters()
 
-        # Value head: same hidden size as the model
+        # Value head: same hidden size as the model.
+        # Keep critic math in fp32 for stability and to avoid bf16/float mismatches.
         hidden_size = self.backbone.config.hidden_size
-        self.value_head = ValueHead(hidden_size).to(device)
+        self.value_head = ValueHead(hidden_size).to(device=device, dtype=torch.float32)
 
         logger.info(f"Model ready. Hidden size: {hidden_size}")
 
@@ -187,7 +203,8 @@ class ActorCritic(nn.Module):
         )
         logits         = out.logits                     # (B, T, V)
         last_hidden    = out.hidden_states[-1]          # (B, T, H)
-        values         = self.value_head(last_hidden)   # (B, T)
+        # Explicitly align hidden states to the value head dtype (fp32 by design).
+        values         = self.value_head(last_hidden.to(torch.float32))   # (B, T)
         return logits, values
 
     @torch.no_grad()
@@ -200,24 +217,36 @@ class ActorCritic(nn.Module):
         """
         Efficient forward for rollout collection (no grad).
         Returns per-token log-probs and values, masked to response tokens only.
+        Tensors are padded to match input sequence length.
         """
         logits, values = self.forward(input_ids, attention_mask)
 
-        # log-prob of the actual token at each position
-        log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)   # (B, T-1, V)
-        token_ids = input_ids[:, 1:]                            # (B, T-1)  next tokens
-        token_lp  = log_probs.gather(
-            dim   = -1,
-            index = token_ids.unsqueeze(-1)
-        ).squeeze(-1)                                           # (B, T-1)
+        # log-prob of the actual token at each position, memory-efficiently
+        token_ids = input_ids[:, 1:]                            # (B, T-1) next tokens
+        token_lp  = _token_logprobs_from_logits(logits[:, :-1, :], token_ids)
 
         # Align values with response positions (drop last position)
         values_shifted = values[:, :-1]                         # (B, T-1)
 
-        # Apply response mask
+        # Apply response mask (shift by 1 to match T-1 predictions)
         resp_mask_shifted = response_mask[:, 1:]                # (B, T-1)
 
-        return token_lp * resp_mask_shifted, values_shifted * resp_mask_shifted
+        masked_lp = token_lp * resp_mask_shifted               # (B, T-1)
+        masked_vals = values_shifted * resp_mask_shifted        # (B, T-1)
+
+        # Pad back to full sequence length T by prepending zeros at position 0
+        # (position 0 has no "previous context" to predict from, so log-prob is undefined)
+        batch_size = masked_lp.shape[0]
+        pad_lp = torch.cat(
+            [torch.zeros(batch_size, 1, device=masked_lp.device, dtype=masked_lp.dtype), masked_lp],
+            dim=1
+        )
+        pad_vals = torch.cat(
+            [torch.zeros(batch_size, 1, device=masked_vals.device, dtype=masked_vals.dtype), masked_vals],
+            dim=1
+        )
+
+        return pad_lp, pad_vals
 
     @torch.no_grad()
     def generate_step(
@@ -236,7 +265,7 @@ class ActorCritic(nn.Module):
         cur_ids = input_ids
         cur_msk = attention_mask
 
-        stop_strings = ["</tool_call>", "</respond>"]
+        stop_strings = ["</tool_call>", "</respond>", "<|im_end|>"]
 
         for _ in range(cfg.max_new_tokens):
             with torch.no_grad():
@@ -304,7 +333,7 @@ class ReferenceModel:
         logger.info(f"Loading frozen reference model: {model_name}")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype = torch.float32,
+            torch_dtype = torch.bfloat16,
             device_map  = "auto",
         )
         self.model.eval()
@@ -324,10 +353,10 @@ class ReferenceModel:
             attention_mask = attention_mask,
             return_dict    = True,
         )
-        log_probs = F.log_softmax(out.logits[:, :-1, :], dim=-1)
         token_ids = input_ids[:, 1:]
-        token_lp  = log_probs.gather(-1, token_ids.unsqueeze(-1)).squeeze(-1)
-        resp_mask = response_mask[:, 1:]
+        token_lp  = _token_logprobs_from_logits(out.logits[:, :-1, :], token_ids)
+        # Ensure mask is on the same device as model outputs.
+        resp_mask = response_mask[:, 1:].to(token_lp.device)
         return token_lp * resp_mask
 
 
@@ -340,15 +369,18 @@ class Episode:
     """
     Everything collected during one rollout episode.
     Stored before the PPO update.
+
+    All sequence tensors must have the same length T (including padding at position 0).
+    Position 0 has zero log-prob and value since there's no prior context to predict from.
     """
     # Tokenised full sequence: [prompt tokens | response tokens]
-    input_ids:      torch.Tensor   # (T,)
-    attention_mask: torch.Tensor   # (T,)
+    input_ids:      torch.Tensor   # (T,) — full sequence
+    attention_mask: torch.Tensor   # (T,) — full sequence
     response_mask:  torch.Tensor   # (T,) — 1 for response tokens, 0 for prompt
 
-    # Collected during rollout (no_grad)
-    old_log_probs:  torch.Tensor   # (T,) per-token, masked
-    old_values:     torch.Tensor   # (T,) per-token, masked
+    # Collected during rollout (no_grad) — all padded to length T
+    old_log_probs:  torch.Tensor   # (T,) per-token, masked; position 0 is zero
+    old_values:     torch.Tensor   # (T,) per-token, masked; position 0 is zero
 
     # Scalar reward from reward model (assigned to last response token)
     reward:         float
@@ -556,14 +588,21 @@ class PPOUpdater:
     def _update_step(self, mini_batch: list[Episode]) -> dict:
         """One gradient step on a mini-batch of episodes."""
         cfg = self.cfg
+        beta = self.kl_ctrl.beta
 
-        total_policy_loss = torch.tensor(0.0, device=self.device)
-        total_value_loss  = torch.tensor(0.0, device=self.device)
-        total_entropy     = torch.tensor(0.0, device=self.device)
-        total_kl          = torch.tensor(0.0, device=self.device)
+        total_policy_loss = 0.0
+        total_value_loss  = 0.0
+        total_entropy     = 0.0
+        total_kl          = 0.0
         n_tokens          = 0
         approx_kl_list    = []
         clip_frac_list    = []
+
+        total_batch_tokens = sum(int(ep.response_mask[1:].sum().item()) for ep in mini_batch)
+        if total_batch_tokens == 0:
+            return {"policy_loss":0,"value_loss":0,"entropy":0,"kl":0,"approx_kl":0,"clip_frac":0}
+
+        self.optimizer.zero_grad(set_to_none=True)
 
         for ep in mini_batch:
             ids   = ep.input_ids.unsqueeze(0).to(self.device)       # (1, T)
@@ -576,28 +615,28 @@ class PPOUpdater:
             # ── Forward: actor-critic ──────────────────────────────────
             logits, values = self.ac(ids, mask)
             # log-probs of actual next tokens
-            lp_all   = F.log_softmax(logits[:, :-1, :], dim=-1)    # (1,T-1,V)
             tgt_ids  = ids[:, 1:]                                   # (1,T-1)
-            new_lp   = lp_all.gather(-1, tgt_ids.unsqueeze(-1)).squeeze(-1).squeeze(0)  # (T-1,)
+            new_lp   = _token_logprobs_from_logits(logits[:, :-1, :], tgt_ids).squeeze(0)  # (T-1,)
             new_vals = values[:, :-1].squeeze(0)                    # (T-1,)
             rmask_s  = rmask[1:]                                    # (T-1,) aligned
 
             # ── Forward: reference model for KL ───────────────────────
             ref_lp = self.ref.get_logprobs(ids, mask, ep.response_mask.unsqueeze(0))
-            ref_lp = ref_lp.squeeze(0)[1:]                         # (T-1,)
+            ref_lp = ref_lp.squeeze(0)                             # (T-1,)
 
             # Select only response token positions
             resp_pos = rmask_s.bool()
             if resp_pos.sum() == 0:
                 continue
+            resp_pos_cpu = resp_pos.cpu()
 
             new_lp_resp  = new_lp[resp_pos]
             new_val_resp = new_vals[resp_pos]
             ref_lp_resp  = ref_lp[resp_pos]
-            old_lp_resp  = ep.old_log_probs[1:][resp_pos].to(self.device)
-            old_val_resp = ep.old_values[1:][resp_pos].to(self.device)
-            adv_resp     = ep.advantages[1:][resp_pos].to(self.device)
-            ret_resp     = ep.returns[1:][resp_pos].to(self.device)
+            old_lp_resp  = ep.old_log_probs[1:][resp_pos_cpu].to(self.device)
+            old_val_resp = ep.old_values[1:][resp_pos_cpu].to(self.device)
+            adv_resp     = ep.advantages[1:][resp_pos_cpu].to(self.device)
+            ret_resp     = ep.returns[1:][resp_pos_cpu].to(self.device)
 
             n = resp_pos.sum().item()
             n_tokens += n
@@ -642,33 +681,32 @@ class PPOUpdater:
             kl           = kl_per_token.clamp(min=0)   # KL is non-negative
 
             # ── Total loss ─────────────────────────────────────────────
-            total_policy_loss = total_policy_loss + policy_loss * n
-            total_value_loss  = total_value_loss  + value_loss  * n
-            total_entropy     = total_entropy     + entropy     * n
-            total_kl          = total_kl          + kl          * n
+            total_policy_loss += policy_loss.detach().item() * n
+            total_value_loss  += value_loss.detach().item() * n
+            total_entropy     += entropy.detach().item() * n
+            total_kl          += kl.detach().item() * n
+
+            # Backprop per episode to avoid keeping full mini-batch graphs in memory.
+            ep_loss = (
+                  policy_loss
+                + cfg.vf_coef      * value_loss
+                - cfg.entropy_coef * entropy
+                + beta             * kl
+            )
+            (ep_loss * (n / total_batch_tokens)).backward()
 
         if n_tokens == 0:
+            self.optimizer.zero_grad(set_to_none=True)
             return {"policy_loss":0,"value_loss":0,"entropy":0,"kl":0,"approx_kl":0,"clip_frac":0}
 
-        # Normalise by total response tokens
-        beta = self.kl_ctrl.beta
-        loss = (
-              (total_policy_loss / n_tokens)
-            + cfg.vf_coef    * (total_value_loss  / n_tokens)
-            - cfg.entropy_coef * (total_entropy   / n_tokens)
-            + beta           * (total_kl          / n_tokens)
-        )
-
-        self.optimizer.zero_grad()
-        loss.backward()
         nn.utils.clip_grad_norm_(self.ac.parameters(), cfg.max_grad_norm)
         self.optimizer.step()
 
         return {
-            "policy_loss": (total_policy_loss / n_tokens).item(),
-            "value_loss":  (total_value_loss  / n_tokens).item(),
-            "entropy":     (total_entropy     / n_tokens).item(),
-            "kl":          (total_kl          / n_tokens).item(),
+            "policy_loss": (total_policy_loss / n_tokens),
+            "value_loss":  (total_value_loss  / n_tokens),
+            "entropy":     (total_entropy     / n_tokens),
+            "kl":          (total_kl          / n_tokens),
             "approx_kl":   float(np.mean(approx_kl_list)) if approx_kl_list else 0.0,
             "clip_frac":   float(np.mean(clip_frac_list)) if clip_frac_list else 0.0,
         }

@@ -2,7 +2,7 @@
 # All hyperparameters in one place — no magic numbers in code
 
 model:
-  base_model: "Qwen/Qwen2.5-3B-Instruct"   # swap to 3B for faster iteration
+  base_model: "Jackrong/Qwen3.5-0.8B-Claude-4.6-Opus-Reasoning-Distilled-GGUF"   # set preferred default model
   sft_checkpoint: "checkpoints/sft"
   load_in_4bit: false                        # set true if GPU < 24GB
   use_lora: true
@@ -34,7 +34,7 @@ ppo:
   horizon: 10000                # steps for KL adaptive controller
 
   # Generation during rollout
-  max_new_tokens: 256           # per step (tool call or respond)
+  max_new_tokens: 128           # per step (tool call or respond)
   temperature: 0.7
   top_p: 0.9
   do_sample: true

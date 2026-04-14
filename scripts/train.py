@@ -25,7 +25,7 @@ Flags:
   --lr          override learning rate
   --episodes    override total episodes
   --no-lora     disable LoRA (full fine-tuning, needs more VRAM)
-  --model       override model name (default: Qwen/Qwen2.5-0.5B-Instruct)
+  --model       override model name (default: Qwen/Qwen3.5-2B)
   --device      cpu | cuda | cuda:0 (default: auto-detect)
 """
 
@@ -35,13 +35,13 @@ import sys
 import os
 
 # Make src importable
-sys.path.insert(0, os.path.dirname(__file__))
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+sys.path.insert(0, ROOT_DIR)
 
 logging.basicConfig(
     level  = logging.INFO,
     format = "%(asctime)s %(levelname)s %(name)s — %(message)s",
     handlers=[
-        logging.StreamHandler(),
         logging.FileHandler("logs/train.log", mode="a"),
     ]
 )
@@ -57,7 +57,7 @@ def parse_args():
     p.add_argument("--lr",          type=float, default=None)
     p.add_argument("--episodes",    type=int,   default=None)
     p.add_argument("--no-lora",     action="store_true")
-    p.add_argument("--model",       default="Qwen/Qwen2.5-0.5B-Instruct")
+    p.add_argument("--model",       default="Qwen/Qwen3.5-0.8B")
     p.add_argument("--device",      default=None)
     return p.parse_args()
 
@@ -75,6 +75,7 @@ def run_sft(args):
     from datasets import Dataset
 
     model_name = args.model
+    
     tokenizer  = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -113,7 +114,7 @@ def run_sft(args):
         return tokenizer(
             example["text"],
             truncation=True,
-            max_length=2048,
+            max_length=1024,
             padding="max_length",
         )
 
@@ -124,7 +125,6 @@ def run_sft(args):
         model         = model,
         args          = train_args,
         train_dataset = tokenized,
-        tokenizer     = tokenizer,
     )
     trainer.train()
     trainer.save_model("checkpoints/sft")
@@ -145,7 +145,7 @@ def run_ppo(args, stage: int):
     cfg = PPOConfig(
         model_name     = args.model,
         use_lora       = not args.no_lora,
-        batch_size     = args.batch_size or (4 if args.smoke_test else 16),
+        batch_size     = args.batch_size or (4 if args.smoke_test else 4),
         mini_batch_size= 2 if args.smoke_test else 4,
         total_episodes = args.episodes or (10 if args.smoke_test else 10_000),
         lr             = args.lr or 1e-5,

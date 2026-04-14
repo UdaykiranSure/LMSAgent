@@ -23,6 +23,7 @@ What the demos look like:
 We generate these programmatically from mock DBs — no human labelling needed.
 """
 
+import sys
 import os
 import yaml
 import json
@@ -30,6 +31,9 @@ import argparse
 import logging
 from datetime import date, timedelta
 import random
+
+# Add parent directory to path so we can import src modules
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments
@@ -325,7 +329,7 @@ def run_sft(config_path: str):
         tokenizer       = tokenizer,
         train_dataset   = dataset,
         args            = training_args,
-        max_seq_length  = 4096,
+        max_seq_length  = 500,
         dataset_text_field = "text",
     )
 

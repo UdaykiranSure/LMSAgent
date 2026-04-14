@@ -126,7 +126,8 @@ class PPOTrainer:
         t_start    = time.time()
 
         while episodes_done < cfg.total_episodes:
-
+            print("Allocated:", torch.cuda.memory_allocated()/1e9)
+            print("Reserved :", torch.cuda.memory_reserved()/1e9)
             # ── 1. Sample queries ──────────────────────────────────────
             batch   = self.dataset.sample_batch(cfg.batch_size)
             queries = [b[0] for b in batch]
@@ -146,7 +147,7 @@ class PPOTrainer:
             if not episodes:
                 logger.warning("Empty episode batch — skipping")
                 continue
-
+            
             # ── 3. Apply reward weighting (dense vs sparse) ───────────
             for ep, original_batch in zip(episodes, batch[:len(episodes)]):
                 # ep.reward is the terminal reward from reward model
@@ -156,12 +157,17 @@ class PPOTrainer:
 
             # ── 4. Fill buffer ─────────────────────────────────────────
             buffer.clear()
+            print("Allocated:", torch.cuda.memory_allocated()/1e9)
+            print("Reserved :", torch.cuda.memory_reserved()/1e9)   
             for ep in episodes:
                 buffer.add(ep)
+                print("Allocated:", torch.cuda.memory_allocated()/1e9)
+                print("Reserved :", torch.cuda.memory_reserved()/1e9)
 
             # ── 5. PPO update ──────────────────────────────────────────
             update_stats = self.updater.update(buffer)
-
+            print("Allocated:", torch.cuda.memory_allocated()/1e9)
+            print("Reserved :", torch.cuda.memory_reserved()/1e9)
             episodes_done += len(episodes)
             self.global_step += 1
 

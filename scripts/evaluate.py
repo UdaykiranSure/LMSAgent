@@ -12,12 +12,17 @@ Metrics:
   - step_efficiency:      mean(optimal_steps / actual_steps)
 """
 
+import sys
+import os
 import argparse
 import yaml
 import json
 import logging
 from datetime import date, timedelta
 from collections import defaultdict
+
+# Add parent directory to path so we can import src modules
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 

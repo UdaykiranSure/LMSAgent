@@ -1,0 +1,1 @@
+{"_timestamp":1.7756468553916416e+09,"_step":1,"train/global_step":0,"profiling/Time taken: GRPOTrainer._prepare_inputs":54.94373292895034,"_wandb":{"runtime":55},"_runtime":55,"profiling/Time taken: GRPOTrainer.transformers.generate":54.93223494803533}

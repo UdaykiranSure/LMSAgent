@@ -37,12 +37,90 @@ class EpisodeState:
     done:           bool = False
     final_response: Optional[str] = None
 
+SYSTEM_PROMPT = """
+You are a student assistant agent that interacts with tools step-by-step.
 
-SYSTEM_PROMPT = """You are a student assistant. You have zero knowledge about the student.
-Call get_subjects() first to verify enrollment, then the appropriate tools.
-Use <tool_call>{"tool":"...","params":{...}}</tool_call> for tool calls.
-Use <respond>answer</respond> for your final answer."""
+You have ZERO prior knowledge about the student.
+ALL information must come from tool calls.
 
+---
+
+## AVAILABLE TOOLS
+
+1. get_subjects()
+2. get_assignments(subject)
+3. get_assignment_details(subject)
+4. get_grades(subject)
+5. get_notes(subject)
+6. get_announcements(subject)
+7. get_schedule(subject)
+
+---
+
+## STRICT ACTION FORMAT
+
+You MUST respond with ONLY ONE of the following:
+
+1. TOOL CALL:
+
+<tool_call>{"tool": "tool_name", "params": {}}</tool_call>
+
+Rules:
+
+* Use DOUBLE quotes only (valid JSON)
+* Always include "tool" and "params"
+* params must be a JSON object (even if empty: {})
+* NO extra text before or after
+
+---
+
+Once you got all the required information, place your answer inside the  <respond> </respond> tags
+
+* Only use this when you have enough information
+* Answer MUST be based only on tool outputs
+
+---
+
+## DECISION POLICY (VERY IMPORTANT)
+
+Follow this reasoning strictly:
+
+1. If subject is unknown → call get_subjects()
+2. If subject is not in subjects → respond "student not enrolled"
+3. If information is required → call the relevant tool
+4. If tool returns empty like for example {'grades': []}:
+    return 
+   * grades → "No grades published"
+   * assignments → "No assignments found"
+5. Do NOT repeat the same tool call with same arguments
+6. Call only ONE tool at a time
+7. Once sufficient data is available → respond
+
+---
+
+## EXAMPLES
+
+User: "Show my RL grades"
+
+Step 1:
+<tool_call>{"tool": "get_subjects", "params": {}}</tool_call>
+
+Step 2 (after seeing RL exists):
+<tool_call>{"tool": "get_grades", "params": {"subject": "RL"}}</tool_call>
+
+Step 3 (if grades empty): <respond>No grades have been published for RL</respond>
+
+---
+
+## IMPORTANT CONSTRAINTS
+
+* DO NOT output anything outside the defined formats
+* DO NOT use single quotes
+* DO NOT skip steps
+* ALWAYS produce valid JSON
+
+---
+"""
 
 class StudentAgentEnvironment:
 
@@ -91,10 +169,10 @@ class StudentAgentEnvironment:
             try:
                 call = json.loads(tool_m.group(1).strip())
             except json.JSONDecodeError:
-                return self._malformed()
+                return self._malformed(step_num, agent_output)
             return self._execute(call, step_num)
 
-        return self._malformed()
+        return self._malformed(step_num, agent_output)
 
     def _execute(self, call: dict, step_num: int) -> dict:
         tool   = call.get("tool", "")
@@ -102,29 +180,29 @@ class StudentAgentEnvironment:
         called = [c["tool"] for c in self.state.tool_calls_made]
 
         # Must call get_subjects first
-        if tool != UNIVERSAL_FIRST and UNIVERSAL_FIRST not in called:
-            self.state.context_window.append({
-                "role": "system",
-                "content": "[Call get_subjects() first to verify enrollment]"
-            })
-            return {"done": False, "intermediate_reward": -0.1,
-                    "info": {"reason": "skipped_get_subjects"}}
+        # if tool != UNIVERSAL_FIRST and UNIVERSAL_FIRST not in called:
+        #     self.state.context_window.append({
+        #         "role": "system",
+        #         "content": "[Call get_subjects() first to verify enrollment]"
+        #     })
+        #     return {"done": False, "intermediate_reward": -0.1,
+        #             "info": {"reason": "skipped_get_subjects"}}
 
         # Duplicate detection
-        key  = (tool, json.dumps(params, sort_keys=True))
-        seen = {(c["tool"], json.dumps(c.get("params", {}), sort_keys=True))
-                for c in self.state.tool_calls_made}
-        if key in seen:
-            result = {"error": "duplicate call"}
-            self.state.context_window.append(
-                {"role": "tool", "name": tool, "content": json.dumps(result)}
-            )
-            return {"done": False, "intermediate_reward": -0.1,
-                    "info": {"reason": "duplicate"}}
+        # key  = (tool, json.dumps(params, sort_keys=True))
+        # seen = {(c["tool"], json.dumps(c.get("params", {}), sort_keys=True))
+        #         for c in self.state.tool_calls_made}
+        # if key in seen:
+        #     result = {"error": "duplicate calling"}
+        #     self.state.context_window.append(
+        #         {"role": "tool", "name": "system", "content": json.dumps(result)}
+        #     )
+        #     return {"done": False, "intermediate_reward": -0.1,
+        #             "info": {"reason": "duplicate"}}
 
         # Execute
         result, shaping = self._run_tool(tool, params)
-
+        logger.info(f"Tool called: {call}, tool response: {result}")
         self.state.tool_calls_made.append({**call, "result": result})
         self.state.steps.append(AgentStep(step_num, call, result, None, False))
         self.state.context_window.append(
@@ -183,11 +261,19 @@ class StudentAgentEnvironment:
         except Exception as e:
             return {"error": str(e)}, -0.1
 
-    def _malformed(self) -> dict:
+    def _malformed(self, step_num, resp) -> dict:
         self.state.context_window.append({
-            "role": "system",
-            "content": "[Use <tool_call>{...}</tool_call> or <respond>...</respond>]"
+            "role": "tool",
+            "name": "system",
+            "content": json.dumps({
+                "error": "malformed_output",
+                "message": """Your output was not recognised.Use exactly ONE of these formats:
+                            Tool call: <tool_call>{'tool':'name','params':{...}} </tool_call> 
+                            Final answer: <respond>your answer here</respond>"""
+                
+            })
         })
+        self.state.steps.append(AgentStep(step_num, None, None, resp, False))
         return {"done": False, "intermediate_reward": -0.05,
                 "info": {"reason": "malformed"}}
 

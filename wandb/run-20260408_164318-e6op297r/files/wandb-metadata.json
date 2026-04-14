@@ -1,0 +1,38 @@
+{
+  "os": "Linux-6.8.0-101-generic-x86_64-with-glibc2.35",
+  "python": "CPython 3.10.12",
+  "startedAt": "2026-04-08T11:13:18.155136Z",
+  "program": "-m scripts.train_grpo",
+  "git": {
+    "remote": "https://github.com/UdaykiranSure/LMSAgent",
+    "commit": "27c3d11a76c7e175382d5cd2a22762e340db20be"
+  },
+  "email": "udaykiran.s933@gmail.com",
+  "root": "/home/uday/aisafety/LMSAgent",
+  "host": "ubuntu-Standard-PC-Q35-ICH9-2009",
+  "executable": "/home/uday/aisafety/LMSAgent/.venv/bin/python",
+  "cpu_count": 14,
+  "cpu_count_logical": 14,
+  "gpu": "NVIDIA RTX A6000",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "1583659646976",
+      "used": "777605472256"
+    }
+  },
+  "memory": {
+    "total": "33649721344"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA RTX A6000",
+      "memoryTotal": "51527024640",
+      "cudaCores": 10752,
+      "architecture": "Ampere",
+      "uuid": "GPU-384e712c-05e0-6c28-0d49-d6451eaaf112"
+    }
+  ],
+  "cudaVersion": "12.8",
+  "writerId": "9j372gqkvolsjb738j7f33e8ckdj4yfz"
+}

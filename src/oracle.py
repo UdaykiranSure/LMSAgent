@@ -812,7 +812,7 @@ class Oracle:
 AMBIGUOUS_SUBJECTS = {"DL", "ML", "AI", "NN", "CV"}
 
 
-def parse_intent_and_conditions(query: str, db: MockStudentDB) -> dict:
+def parse_intent_and_conditions(query: str, db) -> dict:
     """
     Deterministically parse query into intent + runtime conditions.
     Returns the intent string and any modifier flags.
@@ -832,6 +832,8 @@ def parse_intent_and_conditions(query: str, db: MockStudentDB) -> dict:
         intent = "due_this_week"
     elif "notes" in q or "material" in q and "add" not in q:
         intent = "notes_lookup"
+    elif "scheduele" in q and ("exam" in q or "quiz") in q:
+        intent = "exam schedule"
     elif "study plan" in q and subject:
         intent = "study_plan_single"
     elif "study plan" in q and "mid" in q:
@@ -862,7 +864,7 @@ def parse_intent_and_conditions(query: str, db: MockStudentDB) -> dict:
         "enrolled": enrolled,
     }
 
-def extract_subject(query: str, db: MockStudentDB) -> Optional[str]:
+def extract_subject(query: str, db) -> Optional[str]:
     for subj in db.get_subjects():
         if subj.lower() in query.lower():
             return subj
