@@ -149,6 +149,21 @@ TOOL_CHAINS = {
         "get_todos",
         "add_todo",         # M times
     ],
+
+    "overdue_assignments": [
+        "get_subjects",
+        "get_assignments",  # called N times
+    ],
+
+    "schedule_all_tomorrow": [
+        "get_subjects",
+        "get_schedule",     # called N times
+    ],
+
+    "schedule_specific_day": [
+        "get_subjects",
+        "get_schedule",
+    ],
 }
 
 # Early exit paths — what the reward considers CORRECT at each step
@@ -179,6 +194,16 @@ EXIT_CONDITIONS = {
         "optimal_steps": 4,         # get_subjects + get_notes + get_allnotes + RESPOND
         "required_tools": ["get_subjects", "get_notes", "get_allnotes"],
     },
+    "NO_OVERDUE": {
+        "after_step": "get_assignments",
+        "optimal_steps": 3,
+        "required_tools": ["get_subjects", "get_assignments"],
+    },
+    "NO_SUBJECTS": {
+        "after_step": "get_subjects",
+        "optimal_steps": 1,
+        "required_tools": ["get_subjects"],
+    },
 }
 
 
@@ -208,6 +233,21 @@ class Oracle:
 
         # ── Simulate step 1: get_subjects ──────────────────────────────
         all_subjects = db.get_subjects()   # oracle runs this just like agent will
+
+        # ── NO_SUBJECTS exit path (unenrolled student) ─────────────────
+        if not all_subjects:
+            return GroundTruth(
+                correct_answer        = "NO_SUBJECTS",
+                answer_type           = "NO_SUBJECTS",
+                intent                = intent,
+                required_tools        = EXIT_CONDITIONS["NO_SUBJECTS"]["required_tools"],
+                required_tool_families= ["lms"],
+                optimal_steps         = EXIT_CONDITIONS["NO_SUBJECTS"]["optimal_steps"],
+                max_steps             = EXIT_CONDITIONS["NO_SUBJECTS"]["optimal_steps"] + self.BUFFER,
+                exit_paths            = {"NO_SUBJECTS": EXIT_CONDITIONS["NO_SUBJECTS"]},
+                required_facts        = [],
+                oracle_data           = {"all_subjects": []},
+            )
 
         # ── NOT_ENROLLED exit path ─────────────────────────────────────
         if subject and subject not in all_subjects:
@@ -306,6 +346,16 @@ class Oracle:
 
         if intent == "announcements_lookup":
             return self._announcements_lookup(subject, db, all_subjects)
+
+        if intent == "overdue_assignments":
+            return self._overdue_assignments(db, all_subjects, today, N)
+
+        if intent == "schedule_all_tomorrow":
+            return self._schedule_all_tomorrow(db, all_subjects, today, N)
+
+        if intent == "schedule_specific_day":
+            extra_day = ctx.get("day")
+            return self._schedule_specific_day(subject, db, all_subjects, today, extra_day)
 
         # Fallback
         return self._fallback(intent, all_subjects)
@@ -786,6 +836,119 @@ class Oracle:
             oracle_data           = {"all_subjects": all_subjects},
         )
 
+    def _overdue_assignments(self, db, all_subjects, today, N) -> GroundTruth:
+        overdue = {}
+        for s in all_subjects:
+            for a in db.get_assignments(s):
+                d = date.fromisoformat(a["deadline"])
+                if (today - d).days > 0:
+                    overdue.setdefault(s, []).append({"name": a["name"], "deadline": a["deadline"]})
+
+        optimal = N + 2  # get_subjects + N×get_assignments + RESPOND
+
+        if not overdue:
+            return GroundTruth(
+                correct_answer        = "NO_OVERDUE",
+                answer_type           = "NO_OVERDUE",
+                intent                = "overdue_assignments",
+                required_tools        = ["get_subjects"] + ["get_assignments"] * N,
+                required_tool_families= ["lms"],
+                optimal_steps         = optimal,
+                max_steps             = optimal + self.BUFFER,
+                exit_paths            = {"NO_OVERDUE": EXIT_CONDITIONS["NO_OVERDUE"]},
+                required_facts        = [],
+                oracle_data           = {"all_subjects": all_subjects, "overdue": {}},
+            )
+
+        required_facts = [a["deadline"] for items in overdue.values() for a in items]
+        return GroundTruth(
+            correct_answer        = json.dumps(overdue),
+            answer_type           = "set",
+            intent                = "overdue_assignments",
+            required_tools        = ["get_subjects"] + ["get_assignments"] * N,
+            required_tool_families= ["lms"],
+            optimal_steps         = optimal,
+            max_steps             = optimal + self.BUFFER,
+            exit_paths            = {},
+            required_facts        = required_facts,
+            oracle_data           = {"all_subjects": all_subjects, "overdue": overdue},
+        )
+
+    def _schedule_all_tomorrow(self, db, all_subjects, today, N) -> GroundTruth:
+        tomorrow  = today + timedelta(days=1)
+        weekday   = tomorrow.strftime("%A")
+        tomorrow_map = {}
+        for s in all_subjects:
+            c = db.get_schedule(s).get(weekday)
+            if c:
+                tomorrow_map[s] = c["time"]
+
+        optimal = N + 2
+
+        if not tomorrow_map:
+            return GroundTruth(
+                correct_answer        = "NO_CLASS",
+                answer_type           = "NO_CLASS",
+                intent                = "schedule_all_tomorrow",
+                required_tools        = ["get_subjects"] + ["get_schedule"] * N,
+                required_tool_families= ["lms"],
+                optimal_steps         = optimal,
+                max_steps             = optimal + self.BUFFER,
+                exit_paths            = {"NO_CLASS": EXIT_CONDITIONS["NO_CLASS"]},
+                required_facts        = [],
+                oracle_data           = {"all_subjects": all_subjects, "weekday": weekday, "tomorrow_map": {}},
+            )
+
+        return GroundTruth(
+            correct_answer        = json.dumps(tomorrow_map),
+            answer_type           = "set",
+            intent                = "schedule_all_tomorrow",
+            required_tools        = ["get_subjects"] + ["get_schedule"] * N,
+            required_tool_families= ["lms"],
+            optimal_steps         = optimal,
+            max_steps             = optimal + self.BUFFER,
+            exit_paths            = {},
+            required_facts        = list(tomorrow_map.values()) + list(tomorrow_map.keys()),
+            oracle_data           = {"all_subjects": all_subjects, "weekday": weekday, "tomorrow_map": tomorrow_map},
+        )
+
+    def _schedule_specific_day(self, subject, db, all_subjects, today, day_name) -> GroundTruth:
+        schedule = db.get_schedule(subject)
+        weekday  = day_name.capitalize() if day_name else today.strftime("%A")
+        class_   = schedule.get(weekday)
+        chain    = TOOL_CHAINS["schedule_specific_day"]
+
+        if not class_:
+            return GroundTruth(
+                correct_answer        = "NO_CLASS",
+                answer_type           = "NO_CLASS",
+                intent                = "schedule_specific_day",
+                required_tools        = chain,
+                required_tool_families= ["lms"],
+                optimal_steps         = len(chain) + 1,
+                max_steps             = len(chain) + 1 + self.BUFFER,
+                exit_paths            = {
+                    "NOT_ENROLLED": EXIT_CONDITIONS["NOT_ENROLLED"],
+                    "NO_CLASS":     EXIT_CONDITIONS["NO_CLASS"],
+                },
+                required_facts        = [],
+                oracle_data           = {"all_subjects": all_subjects, "schedule": schedule, "weekday": weekday},
+            )
+
+        answer = class_["time"]
+        return GroundTruth(
+            correct_answer        = answer,
+            answer_type           = "exact",
+            intent                = "schedule_specific_day",
+            required_tools        = chain,
+            required_tool_families= ["lms"],
+            optimal_steps         = len(chain) + 1,
+            max_steps             = len(chain) + 1 + self.BUFFER,
+            exit_paths            = {"NOT_ENROLLED": EXIT_CONDITIONS["NOT_ENROLLED"]},
+            required_facts        = [answer, weekday],
+            oracle_data           = {"all_subjects": all_subjects, "schedule": schedule, "weekday": weekday, "class": class_},
+        )
+
     def _fallback(self, intent, all_subjects) -> GroundTruth:
         return GroundTruth(
             correct_answer        = "NO_DATA",
@@ -812,66 +975,125 @@ class Oracle:
 AMBIGUOUS_SUBJECTS = {"DL", "ML", "AI", "NN", "CV"}
 
 
+DAYS_OF_WEEK = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+ABBR_MAP = {
+    "rl":    "RL",
+    "ssl":   "SSL",
+    "dnn":   "DNN",
+    "nlp":   "NLP",
+    "cv":    "CV",
+    "dl":    "Deep Learning",
+    "ss":    "Software Systems",
+    "ml":    "ML",
+    "ai":    "AI",
+    "os":    "OS",
+    "cn":    "CN",
+    "dbms":  "DBMS",
+    "algo":  "Algorithms",
+    "math":  "Mathematics",
+}
+
+
+def extract_subject(query: str, db) -> Optional[str]:
+    q_lower = query.lower()
+    for subj in db.get_subjects():
+        if subj.lower() in q_lower:
+            return subj
+    tokens = q_lower.split()
+    for abbr, full in ABBR_MAP.items():
+        if abbr in tokens:
+            return full
+    return None
+
+
 def parse_intent_and_conditions(query: str, db) -> dict:
     """
     Deterministically parse query into intent + runtime conditions.
     Returns the intent string and any modifier flags.
     """
-    q = query.lower()
+    q       = query.lower()
     subject = extract_subject(query, db)
 
-    if "deadline" in q or "due date" in q:
-        intent = "deadline_lookup"
-    elif "marks" in q or "grade" in q or "exam" in q and "syllabus" not in q:
-        intent = "grades_lookup"
-    elif "today" in q and ("class" in q or "schedule" in q):
-        intent = "schedule_today"
-    elif "tomorrow" in q:
-        intent = "schedule_tomorrow"
-    elif "this week" in q and ("assignment" in q or "due" in q):
-        intent = "due_this_week"
-    elif "notes" in q or "material" in q and "add" not in q:
-        intent = "notes_lookup"
-    elif "scheduele" in q and ("exam" in q or "quiz") in q:
-        intent = "exam schedule"
-    elif "study plan" in q and subject:
-        intent = "study_plan_single"
-    elif "study plan" in q and "mid" in q:
-        intent = "study_plan_all"
-    elif "add" in q and ("material" in q or "file" in q):
+    # Detect named day-of-week (e.g. "RL class on Monday")
+    day_match = next((d for d in DAYS_OF_WEEK if d in q), None)
+
+    # ── Write operations (check before read keywords to avoid mis-routing) ──
+    if "add" in q and ("material" in q or "file" in q):
         intent = "material_sync"
     elif "add" in q and "todo" in q:
         intent = "add_deadline_todo"
+
+    # ── Overdue / missed ───────────────────────────────────────────────────
+    elif any(w in q for w in ("overdue", "missed", "miss", "missing", "late submission", "past due")):
+        intent = "overdue_assignments"
+
+    # ── Deadline / due ─────────────────────────────────────────────────────
+    elif "deadline" in q or "due date" in q:
+        intent = "deadline_lookup"
+
+    # ── This-week due ──────────────────────────────────────────────────────
+    elif "this week" in q and ("assignment" in q or "due" in q):
+        intent = "due_this_week"
+
+    # ── Grades (fix operator precedence: wrap `exam` condition) ───────────
+    elif "marks" in q or "grade" in q or ("exam" in q and "syllabus" not in q):
+        intent = "grades_lookup"
+
+    # ── Schedule: today ───────────────────────────────────────────────────
+    elif "today" in q and ("class" in q or "schedule" in q):
+        intent = "schedule_today" if subject else "schedule_all_today"
+
+    # ── Schedule: tomorrow ────────────────────────────────────────────────
+    elif "tomorrow" in q and ("class" in q or "schedule" in q or not subject):
+        if subject:
+            intent = "schedule_tomorrow"
+        else:
+            intent = "schedule_all_tomorrow"
+
+    # ── Schedule: named day-of-week ────────────────────────────────────────
+    elif day_match and ("class" in q or "schedule" in q):
+        intent = "schedule_specific_day"
+
+    # ── Study plan ─────────────────────────────────────────────────────────
+    elif "study plan" in q:
+        # Named subject takes priority; "mid"/"finals" scope triggers all-subjects
+        if subject:
+            intent = "study_plan_single"
+        elif any(w in q for w in ("mid", "midterm", "midsem", "final", "finals")):
+            intent = "study_plan_all"
+        else:
+            intent = "study_plan_single"
+
+    # ── Notes / materials (read) ───────────────────────────────────────────
+    elif "notes" in q or ("material" in q and "add" not in q):
+        intent = "notes_lookup"
+
+    # ── Resources / syllabus / requirements ───────────────────────────────
     elif "resource" in q or "requirement" in q:
         intent = "resources_lookup"
     elif "syllabus" in q:
         intent = "assignment_details"
+
+    # ── Announcements ─────────────────────────────────────────────────────
+    elif "announcement" in q:
+        intent = "announcements_lookup"
+
     else:
         intent = "notes_lookup"
 
-    # Detect scope: named subject, all subjects, or ambiguous
-    scope = "named" if subject else "all"
-    ambiguous = subject and subject.upper() in AMBIGUOUS_SUBJECTS
+    # Scope: named subject or all
+    scope     = "named" if subject else "all"
+    ambiguous = bool(subject and subject.upper() in AMBIGUOUS_SUBJECTS)
+    enrolled  = subject in db.get_subjects() if subject else True
 
-    # Detect if subject is enrolled
-    enrolled = subject in db.get_subjects() if subject else True
-
-    return {
-        "intent": intent,
-        "subject": subject,
-        "scope": scope,
+    result = {
+        "intent":    intent,
+        "subject":   subject,
+        "scope":     scope,
         "ambiguous": ambiguous,
-        "enrolled": enrolled,
+        "enrolled":  enrolled,
     }
-
-def extract_subject(query: str, db) -> Optional[str]:
-    for subj in db.get_subjects():
-        if subj.lower() in query.lower():
-            return subj
-    # Check abbreviations
-    abbr_map = {"rl": "RL", "ssl": "SSL", "dnn": "DNN", "nlp": "NLP",
-                "cv": "CV", "dl": "Deep Learning", "ss": "Software Systems"}
-    for abbr, full in abbr_map.items():
-        if abbr in query.lower().split():
-            return full
-    return None
+    if day_match:
+        result["day"] = day_match
+    return result

@@ -188,17 +188,17 @@ class StudentAgentEnvironment:
         #     return {"done": False, "intermediate_reward": -0.1,
         #             "info": {"reason": "skipped_get_subjects"}}
 
-        # Duplicate detection
-        # key  = (tool, json.dumps(params, sort_keys=True))
-        # seen = {(c["tool"], json.dumps(c.get("params", {}), sort_keys=True))
-        #         for c in self.state.tool_calls_made}
-        # if key in seen:
-        #     result = {"error": "duplicate calling"}
-        #     self.state.context_window.append(
-        #         {"role": "tool", "name": "system", "content": json.dumps(result)}
-        #     )
-        #     return {"done": False, "intermediate_reward": -0.1,
-        #             "info": {"reason": "duplicate"}}
+        # Duplicate detection — soft penalty to discourage loops without killing episodes
+        key  = (tool, json.dumps(params, sort_keys=True))
+        seen = {(c["tool"], json.dumps(c.get("params", {}), sort_keys=True))
+                for c in self.state.tool_calls_made}
+        if key in seen:
+            result = {"error": "duplicate call — already called this tool with the same params"}
+            self.state.context_window.append(
+                {"role": "tool", "name": "system", "content": json.dumps(result)}
+            )
+            return {"done": False, "intermediate_reward": -0.05,
+                    "info": {"reason": "duplicate"}}
 
         # Execute
         result, shaping = self._run_tool(tool, params)
