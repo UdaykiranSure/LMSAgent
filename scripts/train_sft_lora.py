@@ -29,7 +29,6 @@ from transformers import (
     AutoModelForCausalLM,
     TrainingArguments,
     Trainer,
-    DataCollatorWithPadding,
 )
 from peft import LoraConfig, get_peft_model, TaskType
 
@@ -42,8 +41,8 @@ logger = logging.getLogger(__name__)
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 DEFAULT_MODEL    = "Qwen/Qwen2.5-0.5B-Instruct"
-CHECKPOINT_DIR   = "sft_checkpoints"
-OUTPUT_DIR       = "checkpoints/sft_lora"
+CHECKPOINT_DIR   = "sft_data"
+OUTPUT_DIR       = "checkpoints/sft_lora2"
 MAX_SEQ_LEN      = 2048
 
 
@@ -195,6 +194,17 @@ def build_lora_model(model_name: str, lora_r: int, lora_alpha: int, lora_dropout
     )
 
     model = get_peft_model(model, lora_config)
+
+    # Required with gradient checkpointing + LoRA so checkpointed blocks get a
+    # differentiable input path even though base model weights are frozen.
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+
+    # Keep cache disabled during training (Trainer also toggles this, but set
+    # it explicitly on the model to avoid stale config interactions).
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+
     model.print_trainable_parameters()
     return model
 
@@ -211,10 +221,10 @@ def parse_args():
     p.add_argument("--batch_size",    type=int, default=2,    help="Per-device batch size")
     p.add_argument("--grad_accum",    type=int, default=8)
     p.add_argument("--lr",            type=float, default=2e-4)
-    p.add_argument("--lora_r",        type=int, default=16)
+    p.add_argument("--lora_r",        type=int, default=8)
     p.add_argument("--lora_alpha",    type=int, default=32)
     p.add_argument("--lora_dropout",  type=float, default=0.05)
-    p.add_argument("--report_to",     default="none",         help="wandb / tensorboard / none")
+    p.add_argument("--report_to",     default="wandb",         help="wandb / tensorboard / none")
     return p.parse_args()
 
 

@@ -1,0 +1,107 @@
+{
+  "overall": {
+    "mean_reward": -0.12461538461538456,
+    "n_episodes": 247
+  },
+  "by_level": {
+    "L1": {
+      "mean_reward": -0.134,
+      "n": 100
+    },
+    "L2": {
+      "mean_reward": -0.042,
+      "n": 79
+    },
+    "L3": {
+      "mean_reward": -0.207,
+      "n": 68
+    }
+  },
+  "by_intent": {
+    "add_deadline_todo": {
+      "mean_reward": -0.188,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.838,
+      "n": 19
+    },
+    "announcements_lookup": {
+      "mean_reward": 0.522,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.825,
+      "n": 10
+    },
+    "deadline_lookup": {
+      "mean_reward": -0.302,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.596,
+      "n": 20
+    },
+    "due_this_week": {
+      "mean_reward": 0.064,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.957,
+      "n": 29
+    },
+    "grades_lookup": {
+      "mean_reward": -0.117,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.575,
+      "n": 20
+    },
+    "material_sync": {
+      "mean_reward": -0.081,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.913,
+      "n": 19
+    },
+    "notes_lookup": {
+      "mean_reward": -0.108,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.675,
+      "n": 20
+    },
+    "resources_lookup": {
+      "mean_reward": -0.394,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.592,
+      "n": 30
+    },
+    "schedule_all_today": {
+      "mean_reward": 0.046,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.988,
+      "n": 20
+    },
+    "schedule_specific": {
+      "mean_reward": -0.194,
+      "tool_order_ok": 0.25,
+      "step_efficiency": 0.558,
+      "n": 20
+    },
+    "schedule_tomorrow": {
+      "mean_reward": 0.154,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 1.0,
+      "n": 10
+    },
+    "study_plan_all": {
+      "mean_reward": -0.582,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.575,
+      "n": 10
+    },
+    "study_plan_single": {
+      "mean_reward": -0.157,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.637,
+      "n": 20
+    }
+  },
+  "quality": {
+    "hallucination_rate": 0.0,
+    "step_limit_rate": 0.15,
+    "clean_respond_rate": 0.85,
+    "tool_order_correct": 0.012,
+    "mean_step_efficiency": 0.742
+  }
+}

@@ -16,8 +16,17 @@ logger = logging.getLogger(__name__)
 
 class RuleBasedRewardModel:
 
+    WEIGHT_ALIASES = {
+        "correctness_weight": "correctness",
+        "tool_path_weight": "tool_path",
+        "subject_scope_weight": "subject_scope",
+        "temporal_weight": "temporal",
+        "write_ops_weight": "write_ops",
+        "step_limit_weight": "step_limit",
+    }
+
     def __init__(self, weights: dict = None):
-        self.w = weights or {
+        defaults = {
             "correctness":    1.0,
             "tool_path":      0.4,
             "subject_scope":  0.3,
@@ -26,6 +35,13 @@ class RuleBasedRewardModel:
             "step_limit":     0.2,
         }
 
+        self.w = defaults.copy()
+        if weights:
+            for key, value in weights.items():
+                canonical = self.WEIGHT_ALIASES.get(key, key)
+                if canonical in self.w:
+                    self.w[canonical] = value
+
     def score(self, trajectory: dict, gt) -> dict:
         scores = {
             "correctness":   self._correctness(trajectory, gt),
@@ -33,19 +49,27 @@ class RuleBasedRewardModel:
             "tool_path":     self._tool_path(trajectory, gt),
             "step_limit":    self._step_limit(trajectory, gt),
             "write_ops":     self._write_ops(trajectory, gt),
+            "format":        self._format(trajectory),
         }
 
         r = scores["correctness"] * self.w["correctness"]
         r += scores["tool_path"]  * self.w["tool_path"]
         r += scores["step_limit"] * self.w["step_limit"]
         r += scores["write_ops"]  * self.w["write_ops"]
-
-        # Hallucination: multiplicative collapse
-        if scores["grounding"] < 0:
-            r = scores["grounding"]
+        r += scores["grounding"]  * 0.5   # additive, not multiplicative collapse
+        r += scores["format"]     * 0.2   # small bonus for structural compliance
 
         total = max(-1.0, min(1.0, r))
         return {"total": total, "breakdown": scores}
+
+    def _format(self, traj: dict) -> float:
+        """Reward structural compliance: used correct tags, called at least one tool."""
+        score = 0.0
+        if traj.get("final_response"):      # used <respond> tag
+            score += 0.5
+        if traj.get("tool_calls"):          # made at least one tool call
+            score += 0.5
+        return score
 
     def _correctness(self, traj: dict, gt) -> float:
         resp     = (traj.get("final_response") or "").lower()
@@ -54,7 +78,8 @@ class RuleBasedRewardModel:
 
         if atype == "NOT_ENROLLED":
             return 1.0 if any(p in resp for p in
-                              ["not enrolled","not found","don't have","no subject"]) else -1.0
+                              ["not enrolled","not found","don't have","no subject",
+                               "no record","cannot find"]) else -0.5
 
         if atype in ("NO_DATA", "NO_ASSIGNMENTS", "NO_CLASS"):
             return 1.0 if any(p in resp for p in
@@ -86,25 +111,31 @@ class RuleBasedRewardModel:
 
     def _grounding(self, traj: dict, gt) -> float:
         """Check that response only contains facts present in tool results."""
-        tool_data = " ".join(
-            json.dumps(c.get("result", {})).lower()
-            for c in traj.get("tool_calls", [])
-        )
+        tool_results = [c.get("result", {}) for c in traj.get("tool_calls", [])]
+
+        # Skip grounding when tool results are not available (e.g. GRPO single-shot mode).
+        # All-empty results means the trajectory was parsed from text without actual execution.
+        if all(r == {} for r in tool_results):
+            return 0.0
+
+        tool_data = " ".join(json.dumps(r).lower() for r in tool_results)
         resp = (traj.get("final_response") or "").lower()
 
-        # Extract dates mentioned in response
-        resp_dates = re.findall(r'\d{4}-\d{2}-\d{2}', resp)
-        for d in resp_dates:
+        penalty = 0.0
+
+        # Dates: check the ISO string literally (it appears verbatim in tool JSON)
+        for d in re.findall(r'\d{4}-\d{2}-\d{2}', resp):
             if d not in tool_data:
-                return -1.0   # hallucinated date
+                penalty -= 0.3
 
-        # Extract numbers that look like grades
-        resp_grades = re.findall(r'\b\d{2,3}/\d{2,3}\b', resp)
-        for g in resp_grades:
-            if g not in tool_data:
-                return -1.0
+        # Grades: DB stores {"marks": 72, "max": 100} not "72/100", so check
+        # each part separately rather than the formatted slash string.
+        for m in re.finditer(r'\b(\d{2,3})/(\d{2,3})\b', resp):
+            num, denom = m.group(1), m.group(2)
+            if num not in tool_data and denom not in tool_data:
+                penalty -= 0.3  # both numbers absent → likely hallucinated
 
-        return 0.0
+        return max(-1.0, penalty)
 
     def _tool_path(self, traj: dict, gt) -> float:
         called = [c["tool"] for c in traj.get("tool_calls", [])]
@@ -145,7 +176,7 @@ class RuleBasedRewardModel:
         actual  = traj.get("steps_used", 0)
         max_s   = getattr(gt, "max_steps", 10)
         if actual == 0:
-            return -0.5
+            return -0.2   # no output at all; less harsh than timeout
         if actual >= max_s:
             return -0.3
         return 0.0

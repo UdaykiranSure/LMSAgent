@@ -1,0 +1,107 @@
+{
+  "overall": {
+    "mean_reward": -0.14178861788617889,
+    "n_episodes": 246
+  },
+  "by_level": {
+    "L1": {
+      "mean_reward": -0.14,
+      "n": 98
+    },
+    "L2": {
+      "mean_reward": -0.102,
+      "n": 80
+    },
+    "L3": {
+      "mean_reward": -0.191,
+      "n": 68
+    }
+  },
+  "by_intent": {
+    "add_deadline_todo": {
+      "mean_reward": -0.043,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.872,
+      "n": 19
+    },
+    "announcements_lookup": {
+      "mean_reward": 0.51,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.8,
+      "n": 10
+    },
+    "deadline_lookup": {
+      "mean_reward": -0.311,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.594,
+      "n": 20
+    },
+    "due_this_week": {
+      "mean_reward": -0.023,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.975,
+      "n": 30
+    },
+    "grades_lookup": {
+      "mean_reward": -0.061,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.588,
+      "n": 20
+    },
+    "material_sync": {
+      "mean_reward": -0.124,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.82,
+      "n": 20
+    },
+    "notes_lookup": {
+      "mean_reward": -0.051,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.68,
+      "n": 20
+    },
+    "resources_lookup": {
+      "mean_reward": -0.369,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.65,
+      "n": 30
+    },
+    "schedule_all_today": {
+      "mean_reward": -0.02,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 1.0,
+      "n": 20
+    },
+    "schedule_specific": {
+      "mean_reward": -0.387,
+      "tool_order_ok": 0.333,
+      "step_efficiency": 0.578,
+      "n": 18
+    },
+    "schedule_tomorrow": {
+      "mean_reward": 0.06,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 1.0,
+      "n": 10
+    },
+    "study_plan_all": {
+      "mean_reward": -0.596,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.528,
+      "n": 9
+    },
+    "study_plan_single": {
+      "mean_reward": -0.216,
+      "tool_order_ok": 0.0,
+      "step_efficiency": 0.55,
+      "n": 20
+    }
+  },
+  "quality": {
+    "hallucination_rate": 0.0,
+    "step_limit_rate": 0.167,
+    "clean_respond_rate": 0.833,
+    "tool_order_correct": 0.012,
+    "mean_step_efficiency": 0.744
+  }
+}

@@ -372,25 +372,56 @@ TEMPLATES = [
     QueryTemplate("remind me about the {subject} deadline", 3, "add_deadline_todo", True),
 ]
 
+
+
+
 LEVEL_WEIGHTS = {
-    2: {1: 0.5, 2: 0.5, 3: 0.0},
-    3: {1: 0.2, 2: 0.3, 3: 0.5},
+    1: {1: 1.0, 2: 0.0, 3: 0.0},   # stage 1: L1 only — build fundamentals first
+    2: {1: 0.7, 2: 0.3, 3: 0.0},   # stage 2: mostly L1, introduce some L2
+    3: {1: 0.2, 2: 0.3, 3: 0.5},   # stage 3: full curriculum
 }
+
+# L2 templates that require sweeping all subjects (N+2 optimal steps) — these are
+# much harder than the step budget allows for a small model early in training.
+_SWEEP_INTENTS = {"due_this_week", "schedule_all_today", "schedule_tomorrow"}
 
 
 class EpisodeDataset:
-    def __init__(self, seed: int = 42, stage: int = 2):
+    def __init__(self, seed: int = 42, stage: int = 1):
         self._rng    = random.Random(seed)
         self._oracle = Oracle()
-        self.set_levels([1, 2] if stage == 2 else [1, 2, 3])
+        self._stage  = stage
+        # Pre-group templates by level for weighted sampling
+        self._by_level = {
+            lvl: [t for t in TEMPLATES if t.level == lvl]
+            for lvl in (1, 2, 3)
+        }
+        levels = {1: [1], 2: [1, 2], 3: [1, 2, 3]}.get(stage, [1, 2])
+        self.set_levels(levels)
 
     def set_levels(self, levels: list[int]):
+        self._active_levels = levels
         self._templates = [t for t in TEMPLATES if t.level in levels]
 
     def sample(self, today: Optional[date] = None) -> tuple[str, MockStudentDB, GroundTruth]:
         today = today or date.today()
         db    = MockStudentDB(today, seed=self._rng.randint(0, 99999))
-        tmpl  = self._rng.choice(self._templates)
+
+        # Pick a level according to curriculum weights, then a template within it
+        weights_map = LEVEL_WEIGHTS.get(self._stage, {})
+        active      = [l for l in self._active_levels if weights_map.get(l, 0) > 0]
+        if active:
+            level_weights = [weights_map[l] for l in active]
+            chosen_level  = self._rng.choices(active, weights=level_weights, k=1)[0]
+            pool = self._by_level[chosen_level]
+            # For stage ≤ 2, skip all-subject sweep templates so the agent
+            # isn't penalised for hitting step limits on tasks it can't yet do.
+            if self._stage <= 2:
+                pool = [t for t in pool if t.intent not in _SWEEP_INTENTS] or pool
+        else:
+            pool = self._templates
+
+        tmpl = self._rng.choice(pool)
         if tmpl.needs_subject:
             subject = self._rng.choice(db.get_subjects())
             query   = tmpl.template.replace("{subject}", subject)

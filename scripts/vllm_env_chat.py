@@ -164,7 +164,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run environment loop with local vLLM chat endpoint")
     parser.add_argument("--query", required=True, help="User query to answer")
     parser.add_argument("--model", default="gpt-5.2", help="Model name served by vLLM")
-    parser.add_argument("--base-url", default="http://localhost:4141", help="vLLM server base URL")
+    parser.add_argument("--base-url", default="http://localhost:8000", help="vLLM server base URL")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for mock DB")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature")
     parser.add_argument("--list-models", action="store_true", help="Print served models and exit")

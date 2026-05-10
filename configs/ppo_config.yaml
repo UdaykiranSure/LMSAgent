@@ -2,7 +2,7 @@
 # All hyperparameters in one place — no magic numbers in code
 
 model:
-  base_model: "Jackrong/Qwen3.5-0.8B-Claude-4.6-Opus-Reasoning-Distilled-GGUF"   # set preferred default model
+  base_model: "Qwen/Qwen3.5-0.8B"
   sft_checkpoint: "checkpoints/sft"
   load_in_4bit: false                        # set true if GPU < 24GB
   use_lora: true

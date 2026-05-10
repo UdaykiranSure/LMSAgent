@@ -15,6 +15,12 @@ import argparse
 import logging
 import yaml
 import torch
+from pathlib import Path
+ 
+# Allow running from either project root or scripts/
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
 logging.basicConfig(
@@ -59,13 +65,20 @@ def main():
     from src.trainer import PPOStudentTrainer
     trainer = PPOStudentTrainer(config_path=args.config, stage=args.stage)
 
-    if args.resume:
-        logger.info(f"Resuming from {args.resume}")
-        # TRL PPOTrainer doesn't have native resume, but we can reload weights
-        from peft import PeftModel
-        trainer.model.pretrained_model = PeftModel.from_pretrained(
-            trainer.model.pretrained_model, args.resume
-        )
+    # Determine which adapter to warm-start from:
+    # --resume takes priority; otherwise fall back to sft_checkpoint in config.
+    resume_path = args.resume
+    if not resume_path:
+        with open(args.config) as f:
+            raw = yaml.safe_load(f)
+        sft_ckpt = raw.get("model", {}).get("sft_checkpoint", "")
+        final_path = os.path.join(sft_ckpt, "final") if sft_ckpt else ""
+        if final_path and os.path.isdir(final_path):
+            resume_path = final_path
+            logger.info(f"No --resume given; warm-starting from SFT checkpoint: {resume_path}")
+
+    if resume_path:
+        trainer.load_adapter(resume_path)
 
     trainer.train()
 

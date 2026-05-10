@@ -30,15 +30,7 @@ logger = logging.getLogger(__name__)
 
 # ── Prompt formatting ──────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a student assistant. You have zero prior knowledge about the student.
-You must discover all information through tool calls before answering.
-
-Always start with get_subjects() to confirm the subject exists.
-Then call get_assignments(), get_grades(), get_schedule() etc as needed.
-End with <respond>your answer here</respond>.
-
-Tool call format: <tool_call>{"tool": "name", "params": {...}}</tool_call>
-Final answer format: <respond>answer text here</respond>"""
+from src.environment import SYSTEM_PROMPT  # single source of truth
 
 
 def format_messages(messages: list[dict]) -> str:
@@ -206,6 +198,17 @@ class RolloutCollector:
             exit_type       = env.state.steps[-1].is_terminal and "respond" or "step_limit"
                               if env.state.steps else "error",
             tool_sequence   = [c["tool"] for c in trajectory.get("tool_calls", [])],
+            trajectory_steps = [
+                {
+                    "step_num": s.step_num,
+                    "tool_call": s.tool_call,
+                    "tool_result": s.tool_result,
+                    "response": s.response,
+                    "is_terminal": s.is_terminal,
+                }
+                for s in env.state.steps
+            ],
+            final_response = env.state.final_response or "",
         )
 
     def collect_batch(

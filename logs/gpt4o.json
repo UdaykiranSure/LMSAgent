@@ -1,0 +1,51 @@
+{
+  "overall": {
+    "mean_reward": 0.010631229235880415,
+    "n_episodes": 301
+  },
+  "by_level": {
+    "L1": {
+      "mean_reward": 0.011,
+      "n": 301
+    }
+  },
+  "by_intent": {
+    "deadline_lookup": {
+      "mean_reward": 0.237,
+      "tool_order_ok": 1.0,
+      "step_efficiency": 0.817,
+      "n": 80
+    },
+    "grades_lookup": {
+      "mean_reward": -0.218,
+      "tool_order_ok": 1.0,
+      "step_efficiency": 0.864,
+      "n": 70
+    },
+    "notes_lookup": {
+      "mean_reward": 0.065,
+      "tool_order_ok": 1.0,
+      "step_efficiency": 0.927,
+      "n": 60
+    },
+    "schedule_specific": {
+      "mean_reward": -0.044,
+      "tool_order_ok": 1.0,
+      "step_efficiency": 0.91,
+      "n": 50
+    },
+    "schedule_specific_day": {
+      "mean_reward": -0.053,
+      "tool_order_ok": 1.0,
+      "step_efficiency": 0.844,
+      "n": 41
+    }
+  },
+  "quality": {
+    "hallucination_rate": 0.037,
+    "step_limit_rate": 0.189,
+    "clean_respond_rate": 0.811,
+    "tool_order_correct": 1.0,
+    "mean_step_efficiency": 0.869
+  }
+}

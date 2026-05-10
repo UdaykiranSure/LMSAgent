@@ -126,8 +126,6 @@ class PPOTrainer:
         t_start    = time.time()
 
         while episodes_done < cfg.total_episodes:
-            print("Allocated:", torch.cuda.memory_allocated()/1e9)
-            print("Reserved :", torch.cuda.memory_reserved()/1e9)
             # ── 1. Sample queries ──────────────────────────────────────
             batch   = self.dataset.sample_batch(cfg.batch_size)
             queries = [b[0] for b in batch]
@@ -157,17 +155,14 @@ class PPOTrainer:
 
             # ── 4. Fill buffer ─────────────────────────────────────────
             buffer.clear()
-            print("Allocated:", torch.cuda.memory_allocated()/1e9)
-            print("Reserved :", torch.cuda.memory_reserved()/1e9)   
+            # Release fragmented CUDA cache from rollout before the update
+            # allocates large contiguous tensors (logits, activations).
+            torch.cuda.empty_cache()
             for ep in episodes:
                 buffer.add(ep)
-                print("Allocated:", torch.cuda.memory_allocated()/1e9)
-                print("Reserved :", torch.cuda.memory_reserved()/1e9)
 
             # ── 5. PPO update ──────────────────────────────────────────
             update_stats = self.updater.update(buffer)
-            print("Allocated:", torch.cuda.memory_allocated()/1e9)
-            print("Reserved :", torch.cuda.memory_reserved()/1e9)
             episodes_done += len(episodes)
             self.global_step += 1
 
@@ -314,3 +309,70 @@ def _set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+class PPOStudentTrainer:
+    """
+    Thin wrapper around PPOTrainer that loads config from a YAML file
+    and applies per-stage overrides before constructing the trainer.
+    """
+
+    def __init__(self, config_path: str, stage: int = 2):
+        import yaml
+        with open(config_path) as f:
+            raw = yaml.safe_load(f)
+
+        cfg = PPOConfig(
+            model_name          = raw["model"]["base_model"],
+            load_in_4bit        = raw["model"].get("load_in_4bit", False),
+            use_lora            = raw["model"].get("use_lora", True),
+            lora_r              = raw["model"]["lora"]["r"],
+            lora_alpha          = raw["model"]["lora"]["lora_alpha"],
+            lora_dropout        = raw["model"]["lora"]["lora_dropout"],
+            lora_target_modules = raw["model"]["lora"]["target_modules"],
+            lr                  = raw["ppo"]["learning_rate"],
+            eps_clip            = raw["ppo"]["cliprange"],
+            value_clip          = raw["ppo"]["cliprange_value"],
+            gamma               = raw["ppo"]["gamma"],
+            lam                 = raw["ppo"]["lam"],
+            vf_coef             = raw["ppo"]["vf_coef"],
+            max_grad_norm       = raw["ppo"]["max_grad_norm"],
+            init_kl_coef        = raw["ppo"]["init_kl_coef"],
+            target_kl           = raw["ppo"]["target_kl"],
+            kl_horizon          = raw["ppo"]["horizon"],
+            batch_size          = raw["ppo"]["batch_size"],
+            mini_batch_size     = raw["ppo"]["mini_batch_size"],
+            ppo_epochs          = raw["ppo"]["ppo_epochs"],
+            max_new_tokens      = raw["ppo"]["max_new_tokens"],
+            temperature         = raw["ppo"]["temperature"],
+            top_p               = raw["ppo"]["top_p"],
+            total_episodes      = raw["training"]["total_episodes"],
+            eval_every          = raw["training"]["eval_every"],
+            save_every          = raw["training"]["save_every"],
+            seed                = raw["training"]["seed"],
+        )
+
+        if stage == 3:
+            cfg.init_kl_coef = 0.1
+            cfg.target_kl    = 4.0
+
+        self._trainer = PPOTrainer(cfg)
+        self._stage   = stage
+
+    def load_adapter(self, adapter_path: str):
+        """
+        Load SFT LoRA weights into the already-wrapped PEFT backbone.
+        Uses direct state-dict injection to avoid re-wrapping the model.
+        """
+        from safetensors.torch import load_file
+        ac = self._trainer.actor_critic
+        weights_file = os.path.join(adapter_path, "adapter_model.safetensors")
+        adapter_state = load_file(weights_file, device="cpu")
+        missing, unexpected = ac.backbone.load_state_dict(adapter_state, strict=False)
+        if unexpected:
+            logger.warning(f"Unexpected keys loading adapter (first 5): {unexpected[:5]}")
+        logger.info(f"Loaded SFT adapter weights from {adapter_path} "
+                    f"({len(adapter_state)} tensors, {len(missing)} missing keys ignored)")
+
+    def train(self):
+        self._trainer.train(stage=self._stage)

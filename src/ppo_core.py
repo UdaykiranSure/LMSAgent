@@ -259,21 +259,25 @@ class ActorCritic(nn.Module):
         Autoregressively generate one agent step.
         Stops at </tool_call> or </respond> end tag.
         Returns (new_token_ids, decoded_text).
+        Uses KV cache so each step only processes 1 new token (not the growing full sequence).
         """
-        cfg     = self.cfg
-        out_ids = []
-        cur_ids = input_ids
-        cur_msk = attention_mask
+        cfg              = self.cfg
+        out_ids          = []
+        past_key_values  = None
+        cur_ids          = input_ids
+        cur_msk          = attention_mask
 
         stop_strings = ["</tool_call>", "</respond>", "<|im_end|>"]
 
         for _ in range(cfg.max_new_tokens):
-            with torch.no_grad():
-                outputs = self.backbone(
-                    input_ids      = cur_ids,
-                    attention_mask = cur_msk,
-                    return_dict    = True,
-                )
+            outputs = self.backbone(
+                input_ids         = cur_ids,
+                attention_mask    = cur_msk,
+                past_key_values   = past_key_values,
+                use_cache         = True,
+                return_dict       = True,
+            )
+            past_key_values = outputs.past_key_values
             next_logits = outputs.logits[:, -1, :]   # (1, V)
 
             # Temperature scaling + top-p sampling
@@ -284,18 +288,16 @@ class ActorCritic(nn.Module):
 
             out_ids.append(next_token.item())
 
-            # Append to running context
-            cur_ids = torch.cat([cur_ids, next_token], dim=1)
+            # On the next step only pass the new token; KV cache handles prior context
+            cur_ids = next_token
             cur_msk = torch.cat([cur_msk, torch.ones(1, 1, device=cur_msk.device)], dim=1)
 
             # Check for stop string
             partial = tokenizer.decode(out_ids, skip_special_tokens=True)
             for stop in stop_strings:
                 if stop in partial:
-                    # Trim to end of stop string
                     idx = partial.find(stop) + len(stop)
-                    partial = partial[:idx]
-                    return out_ids, partial
+                    return out_ids, partial[:idx]
 
             # EOS token
             if next_token.item() == tokenizer.eos_token_id:
@@ -393,6 +395,8 @@ class Episode:
     steps_taken:    int  = 0
     exit_type:      str  = "unknown"
     tool_sequence:  list = field(default_factory=list)
+    trajectory_steps: list = field(default_factory=list)
+    final_response: str = ""
 
 
 class PPOBuffer:
@@ -544,9 +548,10 @@ class PPOUpdater:
         self.cfg         = cfg
         self.device      = device
 
-        # Separate learning rates: backbone (LoRA) lower, value head higher
+        # Separate learning rates: backbone (LoRA) lower, value head higher.
+        # Filter to trainable params only — frozen base weights must not enter AdamW.
         self.optimizer = AdamW([
-            {"params": self.ac.backbone.parameters(),   "lr": cfg.lr},
+            {"params": [p for p in self.ac.backbone.parameters() if p.requires_grad], "lr": cfg.lr},
             {"params": self.ac.value_head.parameters(), "lr": cfg.lr * 5},
         ], weight_decay=0.01)
 
@@ -670,10 +675,11 @@ class PPOUpdater:
 
             # ── Entropy bonus ──────────────────────────────────────────
             # Encourages exploration — prevents premature convergence
-            probs_resp = F.softmax(
+            # Use log-softmax to avoid materialising a second (N, V) tensor
+            log_probs_resp = F.log_softmax(
                 logits[:, :-1, :].squeeze(0)[resp_pos], dim=-1
             )
-            entropy = -(probs_resp * torch.log(probs_resp.clamp(min=1e-8))).sum(-1).mean()
+            entropy = -(log_probs_resp.exp() * log_probs_resp).sum(-1).mean()
 
             # ── KL penalty against reference ───────────────────────────
             # per-token KL: p_new * (log_p_new - log_p_ref)

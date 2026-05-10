@@ -72,29 +72,48 @@ Rules:
 * params must be a JSON object (even if empty: {})
 * NO extra text before or after
 
----
+2. FINAL ANSWER:
 
-Once you got all the required information, place your answer inside the  <respond> </respond> tags
+<respond>your answer here</respond>
 
-* Only use this when you have enough information
-* Answer MUST be based only on tool outputs
+* Only use this when you have enough information from tool results
+* Answer MUST be based only on tool outputs — never invent data
 
 ---
 
 ## DECISION POLICY (VERY IMPORTANT)
 
 Follow this reasoning strictly:
-
 1. If subject is unknown → call get_subjects()
-2. If subject is not in subjects → respond "student not enrolled"
+2. If subject is not in subjects list → <respond>not enrolled in that subject</respond>
 3. If information is required → call the relevant tool
-4. If tool returns empty like for example {'grades': []}:
-    return 
-   * grades → "No grades published"
-   * assignments → "No assignments found"
+4. If tool returns empty results:
+   * empty grades → <respond>no data found for grades</respond>
+   * empty assignments → <respond>no assignments found</respond>
+   * no class on that day → <respond>no class scheduled</respond>
 5. Do NOT repeat the same tool call with same arguments
 6. Call only ONE tool at a time
-7. Once sufficient data is available → respond
+7. Once sufficient data is available → respond immediately
+
+---
+
+## ANSWER FORMAT RULES (CRITICAL)
+
+Your <respond> must contain the raw value exactly as it appears in the tool output:
+
+| Information type | Required format in your answer         | Example                        |
+|------------------|----------------------------------------|--------------------------------|
+| Deadline / date  | YYYY-MM-DD (copy from tool output)     | The deadline is 2025-05-10     |
+| Grade / marks    | X/Y (copy numbers from tool output)    | Your grade is 72/100           |
+| Class time       | HH:MM (copy from tool output)          | Class is at 14:00              |
+| Not enrolled     | must contain "not enrolled" or "not found" | not enrolled in that subject |
+| No data          | must contain "no data", "not found", "no assignments found", or "no class" | no assignments found |
+
+WRONG: "The deadline is next Tuesday" — never paraphrase dates
+RIGHT: "The deadline is 2025-05-10"
+
+WRONG: "You scored pretty well, around 70 out of 100"
+RIGHT: "Your grade is 72/100"
 
 ---
 
@@ -105,19 +124,19 @@ User: "Show my RL grades"
 Step 1:
 <tool_call>{"tool": "get_subjects", "params": {}}</tool_call>
 
-Step 2 (after seeing RL exists):
+Step 2 (after seeing RL in subjects):
 <tool_call>{"tool": "get_grades", "params": {"subject": "RL"}}</tool_call>
 
-Step 3 (if grades empty): <respond>No grades have been published for RL</respond>
+Step 3a (if grades = []): <respond>no data found for grades in RL</respond>
+Step 3b (if grades = [{"marks": 85, "max": 100}]): <respond>Your latest RL grade is 85/100</respond>
 
 ---
 
-## IMPORTANT CONSTRAINTS
+User: "When is my DSA assignment deadline"
 
-* DO NOT output anything outside the defined formats
-* DO NOT use single quotes
-* DO NOT skip steps
-* ALWAYS produce valid JSON
+Step 1: <tool_call>{"tool": "get_subjects", "params": {}}</tool_call>
+Step 2: <tool_call>{"tool": "get_assignments", "params": {"subject": "DSA"}}</tool_call>
+Step 3 (if deadline = "2025-06-01"): <respond>The DSA assignment deadline is 2025-06-01</respond>
 
 ---
 """
@@ -188,17 +207,17 @@ class StudentAgentEnvironment:
         #     return {"done": False, "intermediate_reward": -0.1,
         #             "info": {"reason": "skipped_get_subjects"}}
 
-        # Duplicate detection — soft penalty to discourage loops without killing episodes
-        key  = (tool, json.dumps(params, sort_keys=True))
-        seen = {(c["tool"], json.dumps(c.get("params", {}), sort_keys=True))
-                for c in self.state.tool_calls_made}
-        if key in seen:
-            result = {"error": "duplicate call — already called this tool with the same params"}
-            self.state.context_window.append(
-                {"role": "tool", "name": "system", "content": json.dumps(result)}
-            )
-            return {"done": False, "intermediate_reward": -0.05,
-                    "info": {"reason": "duplicate"}}
+        # Duplicate detection
+        # key  = (tool, json.dumps(params, sort_keys=True))
+        # seen = {(c["tool"], json.dumps(c.get("params", {}), sort_keys=True))
+        #         for c in self.state.tool_calls_made}
+        # if key in seen:
+        #     result = {"error": "duplicate calling"}
+        #     self.state.context_window.append(
+        #         {"role": "tool", "name": "system", "content": json.dumps(result)}
+        #     )
+        #     return {"done": False, "intermediate_reward": -0.1,
+        #             "info": {"reason": "duplicate"}}
 
         # Execute
         result, shaping = self._run_tool(tool, params)
@@ -268,8 +287,7 @@ class StudentAgentEnvironment:
             "content": json.dumps({
                 "error": "malformed_output",
                 "message": """Your output was not recognised.Use exactly ONE of these formats:
-                            Tool call: <tool_call>{'tool':'name','params':{...}} </tool_call> 
-                            Final answer: <respond>your answer here</respond>"""
+                            Use <tool_call>{"tool":"name","params":{}} </tool_call> or <respond>answer</respond>"""
                 
             })
         })
@@ -284,6 +302,6 @@ class StudentAgentEnvironment:
             "final_response": self.state.final_response or "",
             "steps_used":     len(self.state.steps),
             "max_steps":      self.max_steps,
-            "today":          self.today,
+            "today":          self.today.isoformat(),
             "intent":         getattr(self.gt, "intent", "unknown"),
         }

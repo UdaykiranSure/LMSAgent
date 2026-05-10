@@ -39,21 +39,31 @@ Usage
   python -m src.grpo_trainer --stage 3   # harder curriculum
 """
 
+from __future__ import annotations
+
 import os
 import re
 import json
 import random
 import logging
 import argparse
+import sys
 import numpy as np
-from datetime import date
+from datetime import date, datetime
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import LoraConfig, TaskType
+import wandb
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainerCallback, TrainerState, TrainerControl
+from peft import LoraConfig, TaskType, PeftModel
 from trl import GRPOTrainer, GRPOConfig
+
+# Allow running this script from either project root or scripts/.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 # ── Project imports ────────────────────────────────────────────────────
 from src.environment import StudentAgentEnvironment
@@ -61,10 +71,21 @@ from src.reward import RuleBasedRewardModel
 from src.dataset import EpisodeDataset, MockStudentDB
 from src.rollout import format_messages, SYSTEM_PROMPT
 
+
+class _DateEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (date, datetime)):
+            return obj.isoformat()
+        return super().default(obj)
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[
+        logging.FileHandler("grpo2.log"), # Saves to file
+        logging.StreamHandler()         # Prints live to console
+    ]
 )
 
 
@@ -84,10 +105,11 @@ class GRPOStudentConfig:
     # ── Model ──────────────────────────────────────────────────────────
     model_name:          str  = "Qwen/Qwen3.5-0.8B"
     load_in_4bit:        bool = False           # set True for <24 GB VRAM
+    sft_adapter_path:    Optional[str] = None   # path to SFT-warmed LoRA adapter
 
     # ── LoRA ───────────────────────────────────────────────────────────
     use_lora:            bool  = True
-    lora_r:              int   = 16
+    lora_r:              int   = 8
     lora_alpha:          int   = 32
     lora_dropout:        float = 0.05
     lora_target_modules: list  = field(default_factory=lambda: [
@@ -96,21 +118,22 @@ class GRPOStudentConfig:
     ])
 
     # ── GRPO core ──────────────────────────────────────────────────────
-    group_size:          int   = 8      # G — completions per prompt
-    #   Advantage = (r - mean(group)) / (std(group) + eps)
+    # Interactive rollout cost = batch_size × group_size × max_env_steps × generate()
+    # Keep batch_size × group_size ≤ 16 for practical wall-clock time.
+    group_size:          int   = 4      # G — completions per prompt (was 8)
 
     # ── Generation ─────────────────────────────────────────────────────
-    max_prompt_length:   int   = 512
-    max_completion_length: int = 1024   # per step; total capped by env
-    temperature:         float = 0.8
+    max_prompt_length:   int   = 1024   # must fit system prompt (~861 tok) + user query
+    max_completion_length: int = 256    # per step; tool calls are short JSON
+    temperature:         float = 0.9    # slightly higher → more within-group diversity
     top_p:               float = 0.9
 
     # ── Rollout / environment ──────────────────────────────────────────
-    max_env_steps:       int   = 10     # max tool calls before forced stop
+    max_env_steps:       int   = 10     # matches GT max_steps for L1/L2 queries
 
     # ── Training ───────────────────────────────────────────────────────
     total_steps:         int   = 2000   # gradient update steps
-    batch_size:          int   = 8      # prompts per step
+    batch_size:          int   = 4      # prompts per step (was 8); 4×4=16 episodes/step
     #   effective_batch = batch_size × group_size = 64 completions
     mini_batch_size:     int   = 2      # per GPU forward pass
     gradient_accum:      int   = 4
@@ -120,10 +143,10 @@ class GRPOStudentConfig:
     warmup_steps:        int   = 50
 
     # ── KL penalty ─────────────────────────────────────────────────────
-    kl_coef:             float = 0.04   # β — penalises deviation from ref
+    kl_coef:             float = 0.1    # β — higher to prevent KL explosion
 
     # ── Curriculum ─────────────────────────────────────────────────────
-    stage:               int   = 2      # 2 = L1+L2, 3 = L1+L2+L3
+    stage:               int   = 1      # 1 = L1 only, 2 = L1+L2 (weighted), 3 = all
 
     # ── Checkpointing ──────────────────────────────────────────────────
     output_dir:          str   = "checkpoints/grpo"
@@ -307,51 +330,62 @@ class RewardFunctionFactory:
     correct?) this is used directly.
     """
 
-    def __init__(self, cfg: GRPOStudentConfig):
+    def __init__(self, cfg: GRPOStudentConfig, tracker: MetricsTracker | None = None):
         self.cfg          = cfg
         self.reward_model = RuleBasedRewardModel()
+        self.tracker      = tracker
 
     def __call__(
         self,
-        prompts:     list[str],
-        completions: list[str],
-        gt_json:     list[str] | None = None,
-        db_json:     list[str] | None = None,
-        query:       list[str] | None = None,
+        prompts:         list[str],
+        completions:     list[str],
+        trajectory_json: list[str] | None = None,   # from interactive rollout_fn
+        gt_json:         list[str] | None = None,
+        db_json:         list[str] | None = None,
+        query:           list[str] | None = None,
         **kwargs,
     ) -> list[float]:
-        """
-        Score each (prompt, completion) pair.
-
-        For multi-step environments the completion is the concatenation of
-        all agent steps.  We parse tool calls and the final <respond> from
-        it to reconstruct a trajectory, then score with RuleBasedRewardModel.
-        """
-        rewards = []
+        rewards      = []
+        breakdowns   = []
+        n_tool_calls = []
+        comp_lens    = []
 
         for i, (prompt, completion) in enumerate(zip(prompts, completions)):
             try:
-                gt_data = json.loads(gt_json[i])  if gt_json else {}
-                db_data = json.loads(db_json[i])  if db_json else {}
-                q       = query[i]                 if query   else ""
+                if trajectory_json and i < len(trajectory_json) and trajectory_json[i]:
+                    # Interactive rollout path: trajectory includes real tool results
+                    traj    = json.loads(trajectory_json[i])
+                    gt_data = traj.pop("_gt_data", {})
+                    gt      = _dict_to_gt(gt_data)
+                else:
+                    # Single-shot fallback: parse completion text (no real tool results)
+                    gt_data = json.loads(gt_json[i]) if gt_json else {}
+                    q       = query[i] if query else ""
+                    gt      = _dict_to_gt(gt_data)
+                    traj    = _parse_trajectory(completion, q, gt)
 
-                # Reconstruct a lightweight GT object
-                gt = _dict_to_gt(gt_data)
-
-                # Reconstruct a lightweight DB object
-                db = _dict_to_db(db_data)
-
-                # Build a trajectory from the completion text
-                trajectory = _parse_trajectory(completion, q, gt)
-
-                score  = self.reward_model.score(trajectory, gt)
+                score  = self.reward_model.score(traj, gt)
                 reward = float(score["total"])
+                breakdowns.append(score["breakdown"])
+                n_tool_calls.append(len(traj.get("tool_calls", [])))
 
             except Exception as e:
                 logger.warning(f"reward_fn error for sample {i}: {e}")
                 reward = 0.0
+                breakdowns.append({})
+                n_tool_calls.append(0)
 
             rewards.append(reward)
+            comp_lens.append(len(completion))
+
+        if self.tracker is not None:
+            self.tracker.record(
+                rewards      = rewards,
+                breakdowns   = breakdowns,
+                n_tool_calls = n_tool_calls,
+                comp_lens    = comp_lens,
+                group_size   = self.cfg.group_size,
+            )
 
         return rewards
 
@@ -399,6 +433,179 @@ def _dict_to_db(d: dict) -> _ReconstructedDB:
     return _ReconstructedDB(d)
 
 
+# ══════════════════════════════════════════════════════════════════════
+# Interactive rollout — runs the real StudentAgentEnvironment step-by-step
+# ══════════════════════════════════════════════════════════════════════
+
+def _run_interactive_episode(
+    model,
+    tokenizer,
+    prompt_ids: list[int],
+    query:      str,
+    db,
+    gt,
+    cfg:        "GRPOStudentConfig",
+    device:     torch.device,
+) -> tuple[list[int], list[float], dict]:
+    """
+    Run one full interactive episode with the real DB.
+
+    The model generates one step at a time; tool results are injected back
+    into the context window between steps.  Only the model's generated tokens
+    are returned in completion_ids — tool-result tokens are not included.
+
+    Log probs are computed per step on the actual context the model saw when
+    generating each token (including interleaved tool results), giving accurate
+    importance weights for the policy-gradient loss.
+
+    Returns
+    -------
+    completion_ids : list[int]   — model-generated token IDs
+    logprobs       : list[float] — per-token log probs under the actual generation context
+    trajectory     : dict        — full trajectory with real tool results + embedded gt
+    """
+    env = StudentAgentEnvironment(db, gt, query, date.today())
+
+    all_comp_ids:  list[int]   = []
+    all_logprobs:  list[float] = []
+
+    for _ in range(cfg.max_env_steps):
+        if env.state.done:
+            break
+
+        ctx_text = format_messages(env.state.context_window)
+        ctx_ids  = tokenizer(
+            ctx_text,
+            return_tensors  = "pt",
+            truncation      = True,
+            max_length      = cfg.max_prompt_length + cfg.max_completion_length,
+            add_special_tokens = False,
+        ).input_ids.to(device)
+
+        # Fix Issue 5: reset stale rope cache on the unwrapped model before each generate
+        _reset_qwen_rope_deltas(model)
+        out = model.generate(
+            ctx_ids,
+            attention_mask          = torch.ones_like(ctx_ids),
+            max_new_tokens          = 256,
+            temperature             = cfg.temperature,
+            top_p                   = cfg.top_p,
+            do_sample               = True,
+            pad_token_id            = tokenizer.eos_token_id,
+            return_dict_in_generate = True,
+            output_scores           = True,   # needed for per-step log probs
+        )
+
+        new_ids   = out.sequences[0, ctx_ids.shape[1]:].tolist()
+        step_text = tokenizer.decode(new_ids, skip_special_tokens=True)
+
+        all_comp_ids.extend(new_ids)
+        # Fix Issue 1: log probs from the actual per-step context, not flat concatenation
+        for tok_id, score in zip(new_ids, out.scores):
+            all_logprobs.append(torch.log_softmax(score[0], dim=-1)[tok_id].item())
+
+        obs = env.step(step_text)
+        if obs["done"]:
+            break
+
+    if not all_comp_ids:
+        all_comp_ids = [tokenizer.eos_token_id]
+        all_logprobs = [0.0]
+
+    trajectory = env.build_trajectory()
+    return all_comp_ids, all_logprobs, trajectory
+
+
+def make_interactive_rollout_fn(cfg: "GRPOStudentConfig"):
+    """
+    Returns a TRL 1.0 rollout_func that runs full interactive episodes with
+    the real MockStudentDB instead of letting TRL do single-shot generation.
+
+    For each prompt in the batch, G episodes are run.  The resulting token IDs
+    and log probs are returned in the format TRL expects.  The full trajectory
+    (including real tool results) is passed as the extra field `trajectory_json`
+    which TRL forwards to the reward function.
+    """
+    def rollout_fn(prompts: list, trainer) -> dict:
+        model     = trainer.accelerator.unwrap_model(trainer.model)
+        tokenizer = trainer.processing_class
+        device    = trainer.accelerator.device
+
+        # _current_inputs has B entries (raw batch); TRL expands prompts to B*G before
+        # calling rollout_func. Use integer division to map back to the source row.
+        inputs = getattr(trainer, "_current_inputs", None) or []
+        n_src  = len(inputs)
+        G      = cfg.group_size
+
+        prompt_ids_out:     list[list[int]]   = []
+        completion_ids_out: list[list[int]]   = []
+        logprobs_out:       list[list[float]] = []
+        trajectory_out:     list[str]         = []
+
+        model.eval()
+        try:
+            with torch.no_grad():
+                for i, prompt in enumerate(prompts):
+                    # Fix Issue 2/6: prompts has B*G entries; inputs has B entries
+                    src_idx = (i // G) if n_src > 0 and G > 0 else 0
+                    row     = inputs[src_idx] if src_idx < n_src else {}
+                    gt_data = json.loads(row.get("gt_json", "{}"))
+                    db_data = json.loads(row.get("db_json", "{}"))
+                    query   = row.get("query", "")
+
+                    gt = _dict_to_gt(gt_data)
+                    db = _dict_to_db(db_data)
+
+                    p_ids = tokenizer(
+                        prompt,
+                        return_tensors     = "pt",
+                        truncation         = True,
+                        max_length         = cfg.max_prompt_length,
+                        add_special_tokens = False,
+                    ).input_ids[0].tolist()
+
+                    comp_ids, lps, traj = _run_interactive_episode(
+                        model, tokenizer, p_ids, query, db, gt, cfg, device
+                    )
+                    traj["_gt_data"] = gt_data
+
+                    prompt_ids_out.append(p_ids)
+                    completion_ids_out.append(comp_ids)
+                    logprobs_out.append(lps)
+                    trajectory_out.append(json.dumps(traj, cls=_DateEncoder))
+        finally:
+            model.train()
+
+        # Fix Issue 4: pad to uniform length and convert to tensors for TRL's loss step
+        pad_id       = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        max_p_len    = max(len(p) for p in prompt_ids_out)
+        max_comp_len = max(len(c) for c in completion_ids_out)
+
+        def _pad(seqs, pad_val, length):
+            return [s + [pad_val] * (length - len(s)) for s in seqs]
+
+        return {
+            "prompt_ids":      torch.tensor(_pad(prompt_ids_out,     pad_id, max_p_len),    dtype=torch.long,    device=device),
+            "completion_ids":  torch.tensor(_pad(completion_ids_out, pad_id, max_comp_len), dtype=torch.long,    device=device),
+            "logprobs":        torch.tensor(_pad(logprobs_out,       0.0,    max_comp_len), dtype=torch.float32, device=device),
+            "trajectory_json": trajectory_out,
+        }
+
+    return rollout_fn
+
+
+class MultiStepGRPOTrainer(GRPOTrainer):
+    """
+    GRPOTrainer subclass that caches the current batch's raw inputs on
+    self._current_inputs before generation, so that rollout_func can
+    read db_json / gt_json / query for environment construction.
+    """
+
+    def _generate_and_score_completions(self, inputs):
+        self._current_inputs = inputs
+        return super()._generate_and_score_completions(inputs)
+
+
 def _parse_trajectory(completion: str, query: str, gt) -> dict:
     """
     Parse a raw completion string into the trajectory dict that
@@ -432,6 +639,185 @@ def _parse_trajectory(completion: str, query: str, gt) -> dict:
         "max_steps":      getattr(gt, "max_steps", 10),
         "intent":         getattr(gt, "intent", ""),
     }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Metrics tracking
+# ══════════════════════════════════════════════════════════════════════
+
+class MetricsTracker:
+    """
+    Accumulates per-call reward statistics from reward_fn and flushes
+    them to wandb + a JSONL log file every `log_every` calls.
+    """
+
+    _BREAKDOWN_KEYS = ("correctness", "grounding", "tool_path", "step_limit", "write_ops")
+
+    def __init__(self, log_every: int = 10, log_file: str = "grpo_metrics.jsonl"):
+        self.log_every = log_every
+        self.log_file  = log_file
+        self._call     = 0
+        self._buf: dict[str, list] = {k: [] for k in (
+            "rewards", "n_tool_calls", "completion_len", "group_reward_std",
+            *self._BREAKDOWN_KEYS,
+        )}
+
+    def record(
+        self,
+        rewards:      list[float],
+        breakdowns:   list[dict],
+        n_tool_calls: list[int],
+        comp_lens:    list[int],
+        group_size:   int = 1,
+    ):
+        self._buf["rewards"].extend(rewards)
+        for bd in breakdowns:
+            for k in self._BREAKDOWN_KEYS:
+                v = bd.get(k)
+                if v is not None:
+                    self._buf[k].append(float(v))
+        self._buf["n_tool_calls"].extend(n_tool_calls)
+        self._buf["completion_len"].extend(comp_lens)
+
+        # Within-group reward std — proxy for within-group exploration
+        if group_size > 1 and len(rewards) % group_size == 0:
+            r_groups = np.array(rewards).reshape(-1, group_size)
+            self._buf["group_reward_std"].extend(r_groups.std(axis=1).tolist())
+
+        self._call += 1
+        if self._call % self.log_every == 0:
+            self._flush()
+
+    def _flush(self):
+        r = np.array(self._buf["rewards"])
+        if len(r) == 0:
+            return
+
+        metrics: dict[str, float] = {
+            "reward/mean":          float(r.mean()),
+            "reward/std":           float(r.std()),
+            "reward/min":           float(r.min()),
+            "reward/max":           float(r.max()),
+            "reward/positive_frac": float((r > 0).mean()),
+        }
+        for k in self._BREAKDOWN_KEYS:
+            arr = self._buf[k]
+            if arr:
+                metrics[f"reward_breakdown/{k}"] = float(np.mean(arr))
+        if self._buf["n_tool_calls"]:
+            metrics["agent/mean_tool_calls"]     = float(np.mean(self._buf["n_tool_calls"]))
+        if self._buf["completion_len"]:
+            metrics["agent/mean_completion_len"] = float(np.mean(self._buf["completion_len"]))
+        if self._buf["group_reward_std"]:
+            metrics["grpo/group_reward_std"]     = float(np.mean(self._buf["group_reward_std"]))
+
+        if wandb.run is not None:
+            wandb.log(metrics)
+
+        with open(self.log_file, "a") as fh:
+            fh.write(json.dumps({"reward_call": self._call, **metrics}) + "\n")
+
+        logger.info(
+            f"[reward] call={self._call} "
+            f"r={metrics['reward/mean']:.3f}±{metrics['reward/std']:.3f} "
+            f"pos={metrics['reward/positive_frac']:.1%} "
+            f"correct={metrics.get('reward_breakdown/correctness', 0):.3f} "
+            f"tool_path={metrics.get('reward_breakdown/tool_path', 0):.3f}"
+        )
+        for lst in self._buf.values():
+            lst.clear()
+
+
+class GRPOLoggingCallback(TrainerCallback):
+    """
+    Captures per-step training diagnostics (grad_norm, KL, entropy, LR)
+    from the Transformers/TRL trainer and writes them to wandb + JSONL.
+
+    Policy entropy is estimated via a forward pass on a small held-out
+    batch every `entropy_every` global steps.
+    """
+
+    _TRL_METRIC_MAP = {
+        "grad_norm":    "train/grad_norm",
+        "learning_rate":"train/lr",
+        "kl":           "train/kl",
+        "loss":         "train/loss",
+        "clip_ratio":   "grpo/clip_ratio",
+        "reward":       "reward/trl_mean",
+        "reward_std":   "reward/trl_std",
+        "entropy":      "train/entropy",
+    }
+
+    def __init__(
+        self,
+        log_file:      str = "grpo_metrics.jsonl",
+        entropy_every: int = 50,
+        entropy_texts: list | None = None,
+    ):
+        self.log_file       = log_file
+        self.entropy_every  = entropy_every
+        self._entropy_texts = entropy_texts or []
+        self._model         = None
+        self._tokenizer     = None
+        self._device        = None
+
+    def set_model_refs(self, model, tokenizer, device):
+        self._model     = model
+        self._tokenizer = tokenizer
+        self._device    = device
+
+    def on_log(self, args, state: TrainerState, control: TrainerControl,
+               logs: dict = None, **kwargs):
+        if not logs:
+            return
+        metrics = {dst: logs[src] for src, dst in self._TRL_METRIC_MAP.items() if src in logs}
+        if not metrics:
+            return
+        if wandb.run is not None:
+            wandb.log(metrics)
+        with open(self.log_file, "a") as fh:
+            fh.write(json.dumps({"global_step": state.global_step, **metrics}) + "\n")
+        logger.info(
+            f"[trainer] step={state.global_step} "
+            + "  ".join(f"{k.split('/')[-1]}={v:.4f}" for k, v in metrics.items())
+        )
+
+    def on_step_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        """Estimate and log policy entropy every `entropy_every` steps."""
+        if (
+            self._model is None
+            or not self._entropy_texts
+            or state.global_step % self.entropy_every != 0
+            or state.global_step == 0
+        ):
+            return
+        entropy = self._estimate_entropy()
+        metrics = {"train/policy_entropy": entropy}
+        if wandb.run is not None:
+            wandb.log(metrics)
+        with open(self.log_file, "a") as fh:
+            fh.write(json.dumps({"global_step": state.global_step, **metrics}) + "\n")
+        logger.info(f"[trainer] step={state.global_step} policy_entropy={entropy:.4f}")
+
+    def _estimate_entropy(self) -> float:
+        """Mean per-token softmax entropy over a small sample."""
+        self._model.eval()
+        entropies: list[float] = []
+        try:
+            with torch.no_grad():
+                for text in self._entropy_texts[:4]:
+                    inputs = self._tokenizer(
+                        text, return_tensors="pt", truncation=True, max_length=256,
+                    ).to(self._device)
+                    logits = self._model(**inputs).logits        # [1, T, V]
+                    probs  = torch.softmax(logits[0], dim=-1)   # [T, V]
+                    ent    = -(probs * probs.log().clamp(min=-1e9)).sum(-1).mean()
+                    entropies.append(ent.item())
+        except Exception as e:
+            logger.debug(f"entropy estimation failed: {e}")
+        finally:
+            self._model.train()
+        return float(np.mean(entropies)) if entropies else 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -502,11 +888,13 @@ class GRPOStudentTrainer:
             per_device_train_batch_size = cfg.batch_size,
             gradient_accumulation_steps = cfg.gradient_accum,
             learning_rate               = cfg.lr,
+            lr_scheduler_type           = "cosine",     # decay LR instead of plateau
             weight_decay                = cfg.weight_decay,
             max_grad_norm               = cfg.max_grad_norm,
             warmup_steps                = cfg.warmup_steps,
             logging_steps               = cfg.logging_steps,
             save_steps                  = cfg.save_steps,
+            save_strategy               = "steps",
             eval_steps                  = cfg.eval_steps,
             seed                        = cfg.seed,
             bf16                        = torch.cuda.is_bf16_supported(),
@@ -524,9 +912,8 @@ class GRPOStudentTrainer:
         )
 
         # ── Dataset ────────────────────────────────────────────────────
-        levels = [1, 2] if cfg.stage == 2 else [1, 2, 3]
-        ep_ds  = EpisodeDataset(seed=cfg.seed, stage=cfg.stage)
-        ep_ds.set_levels(levels)
+        # EpisodeDataset sets levels and curriculum weights from stage internally.
+        ep_ds = EpisodeDataset(seed=cfg.seed, stage=cfg.stage)
 
         # We pre-generate a large dataset; GRPOTrainer will shuffle + repeat.
         n_samples = max(cfg.total_steps * cfg.batch_size, 2000)
@@ -540,18 +927,54 @@ class GRPOStudentTrainer:
 
         logger.info(f"Train: {len(self.train_dataset)} rows | Eval: {len(self.eval_dataset)} rows")
 
-        # ── Reward function ────────────────────────────────────────────
-        self.reward_fn = RewardFunctionFactory(cfg)
+        # ── Reward function + metrics tracker ─────────────────────────
+        self.metrics_tracker = MetricsTracker(
+            log_every = cfg.logging_steps,
+            log_file  = os.path.join(cfg.output_dir, "grpo_metrics.jsonl"),
+        )
+        self.reward_fn = RewardFunctionFactory(cfg, tracker=self.metrics_tracker)
 
-        # ── GRPOTrainer ────────────────────────────────────────────────
-        self.trainer = GRPOTrainer(
-            model           = cfg.model_name,
+        # Load model eagerly with trust_remote_code=True so custom model types
+        # like qwen3_5 do not fail in TRL's AutoConfig path.
+        model_kwargs = {
+            "trust_remote_code": True,
+            "device_map": "auto" if torch.cuda.is_available() else None,
+        }
+        if torch.cuda.is_available():
+            model_kwargs["torch_dtype"] = (
+                torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            )
+        else:
+            model_kwargs["torch_dtype"] = torch.float32
+        if cfg.load_in_4bit:
+            model_kwargs["load_in_4bit"] = True
+
+        base_model = AutoModelForCausalLM.from_pretrained(cfg.model_name, **model_kwargs)
+
+        # ── Load SFT LoRA adapter if provided ─────────────────────────
+        if cfg.sft_adapter_path:
+            logger.info(f"Loading SFT LoRA adapter from {cfg.sft_adapter_path} …")
+            base_model = PeftModel.from_pretrained(
+                base_model,
+                cfg.sft_adapter_path,
+                is_trainable=True,
+            )
+            # Model is already a PeftModel; don't let TRL add another LoRA on top.
+            peft_config = None
+            logger.info("SFT adapter loaded — GRPO will continue training the existing LoRA weights.")
+
+        # ── MultiStepGRPOTrainer ───────────────────────────────────────
+        # rollout_func replaces TRL's single-shot generation with interactive
+        # environment rollouts; the cached _current_inputs give it DB access.
+        self.trainer = MultiStepGRPOTrainer(
+            model           = base_model,
             args            = self.trl_cfg,
             train_dataset   = self.train_dataset,
             eval_dataset    = self.eval_dataset,
             processing_class= self.tokenizer,
             reward_funcs    = self._wrapped_reward_fn,
             peft_config     = peft_config,
+            rollout_func    = make_interactive_rollout_fn(cfg),
         )
 
         # Qwen3.5 caches rope_deltas on the module. During GRPO generation and
@@ -559,6 +982,22 @@ class GRPOStudentTrainer:
         # cache with incompatible shape for the next forward pass.
         self._rope_reset_hooks.append(_install_qwen_rope_reset_hook(self.trainer.model))
         self._rope_reset_hooks.append(_install_qwen_rope_reset_hook(getattr(self.trainer, "ref_model", None)))
+
+        # ── Logging callback ───────────────────────────────────────────
+        # Use a handful of eval prompts as fixed entropy reference texts.
+        entropy_texts = [
+            row["prompt"] for row in self.eval_dataset.select(range(min(4, len(self.eval_dataset))))
+        ]
+        self.logging_cb = GRPOLoggingCallback(
+            log_file      = os.path.join(cfg.output_dir, "grpo_metrics.jsonl"),
+            entropy_every = max(cfg.logging_steps * 5, 50),
+            entropy_texts = entropy_texts,
+        )
+        self.logging_cb.set_model_refs(self.trainer.model, self.tokenizer, self.device)
+        self.trainer.add_callback(self.logging_cb)
+
+        # Ensure output directory exists for log files
+        os.makedirs(cfg.output_dir, exist_ok=True)
 
         logger.info("GRPOTrainer ready.")
 
@@ -571,11 +1010,12 @@ class GRPOStudentTrainer:
         query columns are available here automatically.
         """
         return self.reward_fn(
-            prompts     = prompts,
-            completions = completions,
-            gt_json     = batch.get("gt_json"),
-            db_json     = batch.get("db_json"),
-            query       = batch.get("query"),
+            prompts         = prompts,
+            completions     = completions,
+            trajectory_json = batch.get("trajectory_json"),   # fix Issue 3: was silently dropped
+            gt_json         = batch.get("gt_json"),
+            db_json         = batch.get("db_json"),
+            query           = batch.get("query"),
         )
 
     # ──────────────────────────────────────────────────────────────────
@@ -655,32 +1095,38 @@ def _install_qwen_rope_reset_hook(module: Optional[torch.nn.Module]):
 
 def parse_args() -> GRPOStudentConfig:
     parser = argparse.ArgumentParser(description="GRPO trainer for student agent")
-    parser.add_argument("--model",        default="Qwen/Qwen3.5-0.8B")
+    parser.add_argument("--model",        default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--stage",        type=int,   default=2)
     parser.add_argument("--group_size",   type=int,   default=8)
     parser.add_argument("--total_steps",  type=int,   default=2000)
     parser.add_argument("--batch_size",   type=int,   default=8)
     parser.add_argument("--lr",           type=float, default=5e-7)
-    parser.add_argument("--kl_coef",      type=float, default=0.04)
-    parser.add_argument("--lora_r",       type=int,   default=16)
+    parser.add_argument("--kl_coef",      type=float, default=0.1)
+    parser.add_argument("--lora_r",       type=int,   default=8)
     parser.add_argument("--output_dir",   default="checkpoints/grpo2")
     parser.add_argument("--load_in_4bit", action="store_true")
     parser.add_argument("--seed",         type=int,   default=42)
+    parser.add_argument(
+        "--sft_adapter",
+        default=None,
+        help="Path to an SFT-warmed LoRA adapter directory to warm-start GRPO from.",
+    )
     args = parser.parse_args()
 
     return GRPOStudentConfig(
-        model_name    = args.model,
-        stage         = args.stage,
-        group_size    = args.group_size,
-        total_steps   = args.total_steps,
-        batch_size    = args.batch_size,
-        lr            = args.lr,
-        kl_coef       = args.kl_coef,
-        lora_r        = args.lora_r,
-        lora_alpha    = args.lora_r * 2,
-        output_dir    = args.output_dir,
-        load_in_4bit  = args.load_in_4bit,
-        seed          = args.seed,
+        model_name        = args.model,
+        stage             = args.stage,
+        group_size        = args.group_size,
+        total_steps       = args.total_steps,
+        batch_size        = args.batch_size,
+        lr                = args.lr,
+        kl_coef           = args.kl_coef,
+        lora_r            = args.lora_r,
+        lora_alpha        = args.lora_r * 2,
+        output_dir        = args.output_dir,
+        load_in_4bit      = args.load_in_4bit,
+        seed              = args.seed,
+        sft_adapter_path  = args.sft_adapter,
     )
 
 
